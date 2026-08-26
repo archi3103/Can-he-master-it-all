@@ -1,0 +1,32 @@
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python compiled bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Unit test / coverage outputs
+.pytest_cache/
+.coverage
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Large Model Weights & Local Data (Do not push to GitHub)
+weights/
+data/
+predictions.csv
+
+# OS specific files
+Thumbs.db
+.DS_Store
