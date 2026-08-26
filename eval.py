@@ -40,7 +40,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 METADATA_FILENAME = "dev_metadata.csv"
-IMAGES_SUBDIR = "images"
+IMAGES_SUBDIR = "Images"
 OUTPUT_CSV_PATH = "predictions.csv"
 CHOICE_COLUMNS = ["choice_A", "choice_B", "choice_C", "choice_D"]
 
