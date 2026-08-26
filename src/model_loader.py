@@ -3,17 +3,18 @@ Global, import-time loading of the VLM backbone, processor, and LoRA
 adapter (Section 4.1 of medical_vqa_architecture.md).
 
 Per the "global pre-loading" rule, every heavy object here -- model
-weights, processor/tokenizer, and the LoRA adapter -- is instantiated
-exactly once, at module import time, never inside predict(). Downstream
-modules (src/decode.py, src/predict.py) simply `from src.model_loader
-import model, processor`; the act of importing this module is what
-triggers the weight load and the CUDA warm-up pass below.
+weights, processor/tokenizer, and the LoRA adapter (if present) -- is
+instantiated exactly once, at module import time, never inside predict().
+Downstream modules (src/decode.py, src/predict.py) simply `from
+src.model_loader import model, processor`; the act of importing this
+module is what triggers the weight load and the CUDA warm-up pass below.
 """
 
 import logging
+from pathlib import Path
 
 import torch
-from transformers import AutoModelForVision2Seq, AutoProcessor, AwqConfig
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from src import config
 
@@ -31,19 +32,21 @@ processor = AutoProcessor.from_pretrained(
 )
 
 # ---------------------------------------------------------------------------
-# Backbone: AWQ 4-bit quantized weights (Section 3.3) -- fused kernels are
-# typically faster than bf16 on Ada tensor cores, not just smaller, which
-# directly helps the k * time penalty term in the scoring formula.
+# Backbone: Qwen3-VL-4B-Instruct, loaded natively/unquantized (Section 3.3).
+# Migrated off AWQ-quantized Qwen2-VL-7B specifically to eliminate the
+# autoawq/gptqmodel dependency chain (autoawq archived/deprecated
+# 2025-05-11; its successor, gptqmodel, requires a C++ toolchain to build
+# from source on Windows). No quantization_config is passed at all -- at
+# ~8-9GB in fp16, the 4B model comfortably fits the 48GB RTX 6000 Ada
+# budget without it. (Deployed size was 8B initially; resized to 4B --
+# same class, same code path, config.MODEL_PATH-only change -- to fit the
+# competition's 10GB submission file size limit; see Section 3.1.)
 # ---------------------------------------------------------------------------
-_quantization_config = AwqConfig(**config.AWQ_CONFIG)
-
-
 def _load_model(attn_implementation: str):
-    return AutoModelForVision2Seq.from_pretrained(
+    return Qwen3VLForConditionalGeneration.from_pretrained(
         config.MODEL_PATH,
         torch_dtype=config.TORCH_DTYPE,
         device_map=config.DEVICE,
-        quantization_config=_quantization_config,
         attn_implementation=attn_implementation,
     )
 
@@ -64,12 +67,42 @@ except (ImportError, ValueError) as exc:
 
 # ---------------------------------------------------------------------------
 # LoRA adapter hot-swap (Section 1.3 / 3.2): the fine-tuned adapter is
-# loaded once and set active. Swapping to a different adapter later (e.g.
-# a microscopy-specialized variant) is a cheap set_adapter() call, not a
-# full checkpoint reload.
+# loaded once and set active, if one is actually present. Swapping to a
+# different adapter later (e.g. a microscopy-specialized variant) is a
+# cheap set_adapter() call, not a full checkpoint reload.
+#
+# Optional by design: no fine-tuning script exists in this repository yet
+# (Section 3.2), so weights/lora-medvqa/ won't exist for most setups, and
+# an adapter trained against a different model size (Section 3.1's
+# migration notes -- Qwen2-VL-7B / Qwen3-VL-8B adapters are NOT compatible
+# with Qwen3-VL-4B) would fail to load even if the directory is present.
+# Rather than hard-fail the whole import over a missing or incompatible
+# adapter, fall back to the base model, loudly logged so it's never a
+# silent, unnoticed downgrade.
 # ---------------------------------------------------------------------------
-model.load_adapter(config.LORA_PATH, adapter_name=config.LORA_ADAPTER_NAME)
-model.set_adapter(config.LORA_ADAPTER_NAME)
+_lora_dir = Path(config.LORA_PATH)
+_lora_available = _lora_dir.is_dir() and any(_lora_dir.iterdir())
+
+if not _lora_available:
+    logger.warning(
+        "No LoRA adapter found at %s (missing or empty) -- running the "
+        "base %s model unmodified. Train/place an adapter there to use one.",
+        config.LORA_PATH,
+        config.BASE_MODEL_NAME,
+    )
+else:
+    try:
+        model.load_adapter(config.LORA_PATH, adapter_name=config.LORA_ADAPTER_NAME)
+        model.set_adapter(config.LORA_ADAPTER_NAME)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Found a LoRA adapter at %s but failed to load it (%s) -- "
+            "running the base %s model unmodified instead.",
+            config.LORA_PATH,
+            exc,
+            config.BASE_MODEL_NAME,
+        )
+
 model.eval()
 
 # ---------------------------------------------------------------------------

@@ -81,7 +81,9 @@ The architecture below resolves this tension via **implicit routing** (cheap, de
                                         │
                      ┌──────────────────▼───────────────────┐
                      │  STAGE 5: Frozen/Fine-Tuned VLM Core    │
-                     │  Qwen2-VL-7B-Instruct (AWQ 4-bit)        │
+                     │  Qwen3-VL-4B-Instruct (native, no        │
+                     │    quantization; fits 10GB submission     │
+                     │    size limit)                             │
                      │  + one general-purpose LoRA adapter      │
                      │    ("medvqa")                             │
                      └──────────────────┬───────────────────┘
@@ -133,12 +135,12 @@ Every image first passes through two universal steps, run before any modality-sp
 
 ### 1.3 Why a Single Shared Backbone, Not an Ensemble
 
-A naive "MoE of VLMs" (one full VLM per modality) would require either (a) loading 4 large models into VRAM simultaneously (feasible on 48GB with 4-bit quantization, ~5-6GB each for 7B models, but adds complexity in swapping CUDA contexts) or (b) dynamically loading/unloading weights per query (catastrophic for the latency term in the scoring formula). Instead:
+A naive "MoE of VLMs" (one full VLM per modality) would require either (a) loading 4 large models into VRAM simultaneously (feasible on 48GB — even unquantized, ~8-9GB each in fp16 for the deployed 4B model — but adds complexity in swapping CUDA contexts) or (b) dynamically loading/unloading weights per query (catastrophic for the latency term in the scoring formula). Instead:
 
 - **One shared VLM backbone** stays resident in VRAM at all times (pre-loaded globally).
 - **Modality/intent-specific behavior is injected via prompting and lightweight LoRA adapter switching**, not full model swapping. LoRA adapters (a few hundred MB each) can be hot-swapped in <50ms via PEFT's `set_adapter()`, which is far cheaper than reloading a full checkpoint.
 
-**As implemented today, exactly one general-purpose adapter is loaded and active:** `config.LORA_ADAPTER_NAME = "medvqa"`, loaded once in `src/model_loader.py` via `model.load_adapter(...)` + `model.set_adapter(...)`. The multi-adapter hot-swap capability described above is architecturally supported (PEFT's `set_adapter()` is the mechanism, and it's already in the code) but not yet exercised — no second (e.g. microscopy-specialized) adapter ships or is switched at runtime.
+**As implemented today, exactly one general-purpose adapter is loaded and active, and it's optional:** `config.LORA_ADAPTER_NAME = "medvqa"`, loaded in `src/model_loader.py` via `model.load_adapter(...)` + `model.set_adapter(...)` **only if `config.LORA_PATH` exists and is non-empty**. Since no fine-tuning script exists in this repository (Section 3.2), that directory won't exist for most setups; rather than hard-fail the whole import, the loader logs a warning and continues on the base model unmodified — and the same fallback applies if a directory is present but the adapter fails to load (e.g. one trained against a different model size, Section 3.1's migration notes). The multi-adapter hot-swap capability described above is architecturally supported (PEFT's `set_adapter()` is the mechanism, and it's already in the code) but not yet exercised — no second (e.g. microscopy-specialized) adapter ships or is switched at runtime.
 
 ### 1.4 Hierarchical Subtype Routing (12-Modality Scaling)
 
@@ -259,21 +261,27 @@ This keeps the prompt library small and combinatorial (4 modalities × 5 tracks 
 
 ### 3.1 Backbone Candidates
 
-| Model | Params | Medical Pretraining | VRAM (bf16 / 4-bit) | Notes |
+| Model | Params | Medical Pretraining | VRAM (fp16) | Notes |
 |---|---|---|---|---|
-| **Qwen2-VL-7B-Instruct** | 7B | General, strong OCR/grounding | ~16GB / ~5GB | **Recommended primary.** Best general VLM reasoning + native dynamic resolution (handles radiology's high-res detail well without aggressive downsampling) |
-| **LLaVA-Med-7B (v1.5)** | 7B | Biomedical (PMC articles) | ~15GB / ~5GB | Strong domain prior but weaker general visual grounding; older base architecture (LLaVA v1.5) |
-| **Qwen2-VL-2B-Instruct** | 2B | General | ~5GB / ~2GB | Best latency, noticeably lower ceiling on complex multi-hop questions |
+| **Qwen3-VL-4B-Instruct** | 4B | General, strong OCR/grounding; enhanced MRope + DeepStack multi-level ViT features | ~8-9GB (unquantized) | **Recommended primary (current).** Deployed natively, no quantization; fits the competition's 10GB submission file size limit — see the migration notes below |
+| **Qwen3-VL-8B-Instruct** | 8B | Same architecture, larger LLM decoder | ~16-17.5GB (unquantized) | Rejected as the deployed size: comfortably fits the 48GB VRAM budget, but the weights alone exceed the competition's 10GB submission file size limit — see the second migration note below |
+| **LLaVA-Med-7B (v1.5)** | 7B | Biomedical (PMC articles) | ~15GB | Strong domain prior but weaker general visual grounding; older base architecture (LLaVA v1.5); also exceeds the 10GB submission limit |
+| **Qwen3-VL-2B-Instruct** | 2B | General | ~4GB | Lower-latency fallback within the same generation, unquantized; worth A/B testing against the scoring formula's `k` if it's known or estimable |
 | **CheXagent / BiomedCLIP+LLM hybrids** | Varies | Modality-specific (CXR only) | — | Rejected: single-modality specialists don't generalize to the required breadth |
-| **MedGemma (Google, 4B)** | 4B | Broad biomedical multimodal | ~9GB / ~3GB | Strong candidate if available locally; good accuracy/latency trade-off |
+| **MedGemma (Google, 4B)** | 4B | Broad biomedical multimodal | ~9GB | Strong candidate if available locally; good accuracy/latency trade-off; comparable size to the current primary |
 
-**Recommendation: Qwen2-VL-7B-Instruct as the base**, fine-tuned with **LoRA** on medical VQA corpora. Rationale:
-- Native support for arbitrary image resolutions/aspect ratios (critical since radiology, dermoscopy, and histology have wildly different native resolutions and aspect ratios) via its "Naive Dynamic Resolution" ViT encoder.
+**Recommendation: Qwen3-VL-4B-Instruct as the base**, fine-tuned with **LoRA** on medical VQA corpora. Rationale:
+- Native support for arbitrary image resolutions/aspect ratios (critical since radiology, dermoscopy, and histology have wildly different native resolutions and aspect ratios) via its dynamic-resolution ViT encoder, now with DeepStack multi-level feature integration — a family-level feature shared across the 2B/4B/8B Qwen3-VL sizes, not lost by going smaller.
 - Strong instruction-following baseline makes constrained MCQ decoding more reliable out-of-the-box.
-- Large ecosystem support for 4-bit/8-bit quantization (AWQ, GPTQ, bitsandbytes) and LoRA via PEFT.
-- If VRAM/latency budget is tight, **Qwen2-VL-2B-Instruct** is a strong fallback with ~2-3x lower latency and modest accuracy loss — worth A/B testing against the scoring formula's `k` if it's known or estimable.
+- LoRA fine-tuning via PEFT still applies unchanged (Section 1.3).
+- Fits comfortably inside the competition's 10GB submission file size limit (~8-9GB unquantized) — the deciding factor over the 8B variant, which otherwise would have been kept for its larger reasoning ceiling (see the second migration note below).
+- **Qwen3-VL-2B-Instruct** remains a lower-latency fallback within the same family if the scoring formula's `k` ends up favoring it.
 
-`config.BASE_MODEL_NAME` currently holds `"Qwen/Qwen2-VL-7B-Instruct"`; `config.MODEL_PATH` points at the local AWQ-quantized weights directory the running system actually loads from (Section 5.1).
+**Migration note (AWQ → native, Qwen2-VL → Qwen3-VL):** this project originally targeted AWQ-quantized Qwen2-VL-7B-Instruct (see Section 3.3's earlier rationale for why AWQ was chosen). It was migrated to a native, unquantized Qwen3-VL model after repeated operational friction from the AWQ dependency chain in practice: `autoawq` was archived/deprecated (2025-05-11), its successor `gptqmodel` requires a C++ toolchain to build from source on Windows, and `transformers`' AWQ quantizer eventually made `gptqmodel` a hard, unconditional runtime requirement with no config-level opt-out. Rather than keep patching around an increasingly fragile dependency chain, the backbone moved to the unquantized Qwen3-VL line entirely. See Section 3.3 for the full trade-off discussion, and the note directly below for why the deployed size within that line changed again shortly after.
+
+**Migration note (8B → 4B, submission size limit):** the Qwen3-VL migration above was first deployed at the 8B size (~16-17.5GB unquantized) — VRAM-wise this fits the 48GB RTX 6000 Ada budget with room to spare. However, the competition imposes a strict 10GB submission file size limit, which the 8B weights alone exceed. Qwen3-VL-4B-Instruct (~8-9GB unquantized) fits comfortably inside that limit while staying in the same model family/generation (same architecture, MRope/DeepStack features, identical `Qwen3VLForConditionalGeneration`/`Qwen3VLProcessor` classes — Section 5, item 3 verification), so it was chosen over quantizing the 8B model back down. Re-introducing quantization purely to hit a size target would reopen exactly the autoawq/gptqmodel dependency problems the prior migration eliminated.
+
+`config.BASE_MODEL_NAME` currently holds `"Qwen/Qwen3-VL-4B-Instruct"`; `config.MODEL_PATH` points at the local unquantized weights directory the running system actually loads from (Section 5.1).
 
 ### 3.2 Fine-Tuning Data Strategy
 
@@ -287,7 +295,7 @@ Use publicly available, license-compliant medical VQA datasets **offline, pre-co
 **Fine-tuning blueprint (LoRA):**
 
 ```
-Base model:        Qwen2-VL-7B-Instruct (frozen backbone)
+Base model:        Qwen3-VL-4B-Instruct (frozen backbone, unquantized)
 Adapter method:     LoRA (rank=16-32, alpha=32, dropout=0.05)
 Target modules:     q_proj, k_proj, v_proj, o_proj (language model attention)
                      + optionally vision-tower cross-attn projections
@@ -297,8 +305,8 @@ Training format:    Reformat all QA pairs into strict MCQ format matching
 Loss:               Standard next-token CE loss, masked to only the answer-letter token
 Epochs:             2-3 (medical VQA sets are noisy; more risks overfitting to
                      dataset-specific phrasing quirks)
-Hardware:           Single RTX 6000 Ada is sufficient for LoRA fine-tuning
-                     of a 7B VLM with 4-bit base + LoRA (QLoRA-style)
+Hardware:           Single RTX 6000 Ada is sufficient for LoRA fine-tuning of
+                     a 4B VLM in fp16 + LoRA (no quantization needed on 48GB)
 Adapter variants:   Optionally train 2-3 separate LoRA adapters:
                      (a) general-purpose (all modalities)
                      (b) microscopy-specialized (histology/cytology have the
@@ -312,18 +320,18 @@ Adapter variants:   Optionally train 2-3 separate LoRA adapters:
 
 ### 3.3 Quantization & Trade-offs
 
+**Current decision: no quantization.** `src/model_loader.py` loads Qwen3-VL-4B-Instruct natively (fp16), with no `quantization_config` at all. This section originally recommended AWQ 4-bit quantization for Qwen2-VL-7B; that recommendation and the trade-off table behind it are kept below for the historical comparison, followed by why the project moved off it.
+
 | Config | VRAM | Relative Latency | Accuracy Impact |
 |---|---|---|---|
-| bf16 full precision | ~16GB | 1.0x (baseline) | Best |
-| 8-bit (bitsandbytes) | ~9GB | ~1.1-1.3x slower (dequant overhead) | Negligible loss (<1%) |
-| 4-bit NF4 (QLoRA-style, bitsandbytes) | ~5GB | ~1.0-1.2x (kernel-dependent) | Small loss (~1-2%) |
-| AWQ 4-bit (pre-quantized, purpose-built kernels) | ~5GB | **Faster than bf16** in practice (optimized kernels) | Small loss (~1-2%), often better than bnb 4-bit |
+| bf16/fp16 full precision (**current**) | ~8-9GB (4B model) | 1.0x (baseline) | Best |
+| 8-bit (bitsandbytes) | ~5GB | ~1.1-1.3x slower (dequant overhead) | Negligible loss (<1%) |
+| 4-bit NF4 (QLoRA-style, bitsandbytes) | ~3GB | ~1.0-1.2x (kernel-dependent) | Small loss (~1-2%) |
+| AWQ 4-bit (pre-quantized, purpose-built kernels) | ~3GB | Faster than bf16 in practice (optimized kernels) | Small loss (~1-2%), often better than bnb 4-bit |
 
-**Recommendation:** Use **AWQ 4-bit quantization** for the deployed model. Unlike bitsandbytes 4-bit (which trades VRAM for extra dequantization compute), AWQ ships with fused, hardware-optimized kernels that often *reduce* latency relative to bf16 on Ada-generation GPUs, directly helping the `k * time` penalty term while freeing VRAM headroom for larger batch sizes or KV-cache growth if you batch multiple queries.
+**Why the original AWQ recommendation was dropped, in practice, not just in theory:** AWQ's fused kernels were genuinely attractive on paper (lower VRAM, competitive-or-better latency than bf16). But operationally, the dependency chain proved fragile: `autoawq` (the library providing those kernels) was archived and deprecated on 2025-05-11 and is now unmaintained; its designated successor, `gptqmodel`, requires a C++ toolchain to build from source on Windows (a real blocker encountered running this project); and `transformers`' AWQ quantizer eventually made `gptqmodel` a hard, unconditional runtime dependency for AWQ loading with no config-level way to opt out (confirmed by reading `transformers.quantizers.quantizer_awq` directly — `AwqConfig` forcibly coerces any legacy pure-`autoawq` backend selection back to the `gptqmodel`-backed path). Rather than continue patching around an increasingly unmaintained dependency, the backbone moved to the **unquantized** Qwen3-VL line — first at 8B, then resized to 4B specifically to fit the competition's 10GB submission file size limit (Section 3.1's second migration note), not for any VRAM or latency reason.
 
-Since the RTX 6000 Ada has 48GB VRAM, VRAM is not the binding constraint here — **latency is**. This should tilt every design decision (image resolution, LoRA adapter count, prompt length) toward minimizing wall-clock time per query rather than minimizing memory footprint.
-
-`config.AWQ_CONFIG = {"bits": 4, "fuse_max_seq_len": 2048}` matches this exactly and is what `src/model_loader.py` actually passes to `AwqConfig(...)`.
+**Since the RTX 6000 Ada has 48GB VRAM, VRAM was never the binding constraint here — latency is** (unchanged from the original design philosophy, Section 0). An unquantized 8B model at ~16GB fp16 still leaves enormous VRAM headroom, so the quantization trade-off table above is no longer load-bearing for this deployment; it's kept for context on the historical decision. This should still tilt every *other* design decision (image resolution, LoRA adapter count, prompt length) toward minimizing wall-clock time per query rather than minimizing memory footprint.
 
 ---
 
@@ -331,25 +339,23 @@ Since the RTX 6000 Ada has 48GB VRAM, VRAM is not the binding constraint here �
 
 ### 4.1 Global Pre-Loading (Mandatory per Rules)
 
-All heavy objects — model weights, processor/tokenizer, and the LoRA adapter — are instantiated **once at module import time**, outside `predict()`. (The modality router itself loads no model at all today — it's pure heuristics; see Section 1.2's note on the learned-router stub. The sentence-embedding encoder used for query-intent fallback is likewise loaded once at import time, in `src/router_intent.py`, not here.)
+All heavy objects — model weights, processor/tokenizer, and the LoRA adapter (when present) — are instantiated **once at module import time**, outside `predict()`. (The modality router itself loads no model at all today — it's pure heuristics; see Section 1.2's note on the learned-router stub. The sentence-embedding encoder used for query-intent fallback is likewise loaded once at import time, in `src/router_intent.py`, not here.)
 
 As implemented (`src/model_loader.py`), paths and hyperparameters are read from `src/config.py` rather than hardcoded, and the attention backend has a runtime fallback:
 
 ```python
 # === src/model_loader.py -- GLOBAL, LOADED ONCE ===
-from transformers import AutoModelForVision2Seq, AutoProcessor, AwqConfig
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from src import config
 
 processor = AutoProcessor.from_pretrained(
     config.MODEL_PATH, min_pixels=config.MIN_PIXELS, max_pixels=config.MAX_PIXELS,
 )
 
-_quantization_config = AwqConfig(**config.AWQ_CONFIG)  # bits=4, fuse_max_seq_len=2048
-
 def _load_model(attn_implementation):
-    return AutoModelForVision2Seq.from_pretrained(
+    return Qwen3VLForConditionalGeneration.from_pretrained(
         config.MODEL_PATH, torch_dtype=config.TORCH_DTYPE, device_map=config.DEVICE,
-        quantization_config=_quantization_config, attn_implementation=attn_implementation,
+        attn_implementation=attn_implementation,
     )
 
 try:
@@ -357,8 +363,14 @@ try:
 except (ImportError, ValueError):
     model = _load_model(config.ATTN_IMPLEMENTATION_FALLBACK)  # "sdpa"
 
-model.load_adapter(config.LORA_PATH, adapter_name=config.LORA_ADAPTER_NAME)
-model.set_adapter(config.LORA_ADAPTER_NAME)
+# LoRA is optional: only attempted if config.LORA_PATH exists and is
+# non-empty, and degrades to the base model (logged) if loading fails.
+if Path(config.LORA_PATH).is_dir() and any(Path(config.LORA_PATH).iterdir()):
+    try:
+        model.load_adapter(config.LORA_PATH, adapter_name=config.LORA_ADAPTER_NAME)
+        model.set_adapter(config.LORA_ADAPTER_NAME)
+    except Exception:
+        pass  # logged, falls back to the base model -- see src/model_loader.py
 model.eval()
 
 # Warm-up pass to trigger CUDA kernel compilation / cudnn autotune
@@ -367,6 +379,8 @@ with torch.inference_mode():
     _ = model.generate(**_warmup_inputs, max_new_tokens=1)
     torch.cuda.synchronize()
 ```
+
+**Model class history, briefly:** this loader has gone through `AutoModelForVision2Seq` → `Qwen2VLForConditionalGeneration` (some installed `transformers` builds didn't export the generic Auto class) → the current `Qwen3VLForConditionalGeneration`, following the Section 3.3 migration off AWQ-quantized Qwen2-VL entirely. No `quantization_config` is passed at all now — see Section 3.3. `Qwen3VLForConditionalGeneration` is size-agnostic — the same class loads the 2B/4B/8B Instruct variants alike, so the later 8B → 4B resize (Section 3.1) changed only `config.MODEL_PATH`/`config.BASE_MODEL_NAME`, with zero code changes here.
 
 **Current default is the `sdpa` fallback path, not Flash-Attention 2:** `requirements.txt` (Section 5.4) currently ships with `flash-attn` commented out, so unless it's installed separately, `_load_model(config.ATTN_IMPLEMENTATION)` raises and every deployment falls through to `attn_implementation="sdpa"`. This is a correct, functioning code path (see Section 4.4), just worth knowing it's the realistic default right now rather than a rare edge case.
 
@@ -412,7 +426,7 @@ This single change (single forward pass + logit masking, vs. `generate()` with `
 
 ### 4.3 Image Resolution Control
 
-Qwen2-VL's dynamic resolution ViT is powerful but can be latency-expensive on very large images (a 4000×3000 histology tile, uncapped, produces a large number of vision tokens, ballooning both compute and context length). We cap resolution explicitly:
+Qwen3-VL's dynamic resolution ViT (like its Qwen2-VL predecessor's, which its image processor is still built on — see Section 5.4's note on `Qwen2VLImageProcessor`) is powerful but can be latency-expensive on very large images (a 4000×3000 histology tile, uncapped, produces a large number of vision tokens, ballooning both compute and context length). We cap resolution explicitly:
 
 ```python
 MAX_PIXELS = 1024 * 1024  # tune based on latency budget
@@ -463,8 +477,12 @@ This bounds the number of vision tokens fed into the LLM, directly bounding both
 │   ├── decode.py                  # Stage 6: logit-masked constrained decoding
 │   └── predict.py                 # top-level predict(image, query, choices) function
 └── weights/                      # NOT present in this repo -- expected at deployment
-    ├── qwen2-vl-7b-awq/           # quantized base weights (local, no internet)
-    ├── lora-medvqa/               # fine-tuned LoRA adapter
+    ├── qwen3-vl-4b-instruct/      # unquantized base weights (local, no internet)
+    ├── lora-medvqa/               # fine-tuned LoRA adapter -- NOTE: must be retrained
+    │                              #   against Qwen3-VL-4B specifically; an adapter
+    │                              #   trained against Qwen2-VL-7B OR Qwen3-VL-8B is
+    │                              #   NOT architecture-compatible (different hidden
+    │                              #   sizes/attention config per model size)
     ├── modality-router/            # optional, only used if USE_LEARNED_ROUTER is enabled
     └── stain_reference_matrix.npy  # optional; falls back to the standard Macenko
                                      #   reference vectors if absent (src/config.py)
@@ -589,18 +607,26 @@ if __name__ == "__main__":
 **Current actual content** (`flash-attn` is commented out — see the note below and Section 4.4):
 
 ```
-torch>=2.3.0
-transformers>=4.45.0
+torch>=2.5.0
+torchvision>=0.20.0
+transformers>=4.57.0
 accelerate>=0.33.0
-autoawq>=0.2.6
 peft>=0.12.0
 pillow>=10.0.0
 numpy>=1.26.0
 opencv-python-headless>=4.10.0
 sentence-transformers>=3.0.0
 scikit-image>=0.24.0
+datasets>=2.19.0
+huggingface_hub>=0.23.0
 # flash-attn>=2.6.0
 ```
+
+**No `autoawq` or `gptqmodel`, deliberately:** the backbone migrated off AWQ-quantized Qwen2-VL-7B specifically to eliminate this dependency chain (Section 3.3) — `autoawq` is archived/deprecated (2025-05-11, unmaintained since), and its successor `gptqmodel` requires a C++ toolchain to build from source on Windows, which `transformers`' AWQ quantizer eventually made a hard, unconditional runtime requirement with no config-level opt-out. Neither package is needed at all for native, unquantized Qwen3-VL loading.
+
+`transformers>=4.57.0` (bumped from `4.45.0`): 4.57.0 is the minimum release with Qwen3-VL support (`Qwen3VLForConditionalGeneration`, `Qwen3VLProcessor`).
+
+`torch>=2.5.0` / `torchvision>=0.20.0` (bumped from `2.3.0`): this floor predates the Qwen3-VL migration — it was originally driven by `Qwen2VLVideoProcessor` requiring PyTorch >= 2.5 (disabling itself with an `ImportError` otherwise). `Qwen3VLProcessor` wraps `Qwen2VLImageProcessor` for images and `Qwen3VLVideoProcessor` for video (per `transformers`' own Qwen3-VL docs), so the same torch-version sensitivity carries forward; the floor stays at `2.5.0` regardless. `datasets` / `huggingface_hub` support `src/evaluate_omnimed.py`'s OmniMedVQA loading (Section 5, evaluation tooling) and aren't needed by the `predict()` runtime path itself.
 
 *(Pin exact versions post-validation against the offline environment. `flash-attn` is commented out because it requires a matching CUDA toolkit and is often not buildable without sudo in the offline eval environment; `src/model_loader.py`'s `_load_model()` already falls back to the `sdpa` attention backend automatically when it's unavailable (Section 4.1/4.4), so leaving it commented out is a safe default, not a broken one. Uncomment and reinstall only once a compatible wheel/toolkit is confirmed available in the target environment.)*
 
@@ -619,12 +645,12 @@ scikit-image>=0.24.0
 
 | Decision | Rationale |
 |---|---|
-| Single shared VLM backbone (Qwen2-VL-7B) + one general-purpose LoRA adapter, not model ensemble | Avoids VRAM/latency cost of multiple large models resident or swapped per query |
+| Single shared VLM backbone (Qwen3-VL-4B) + one general-purpose LoRA adapter, not model ensemble | Avoids VRAM/latency cost of multiple large models resident or swapped per query; 4B size chosen to fit the competition's 10GB submission file size limit |
 | Heuristic-only modality router (learned router designed, not implemented) | Near-zero latency cost; the coarse 4-bucket router is unchanged since first implementation |
 | Two-level hierarchical routing: coarse stream (unchanged) + stream-conditional subtype classifier | Extends coverage toward 12 OmniMedVQA-style modalities (Section 1.4) without touching the validated coarse router; an unrecognized subtype degrades to a safe per-stream default rather than failing |
 | Letterbox resize (not center-crop) for vignetted macroscopic subtypes | Avoids discarding genuine peripheral pathology (e.g. peripheral retinal findings) that a fixed-margin crop would assume is unimportant |
 | Logit-masked single-forward-pass decoding | Eliminates autoregressive generation loop entirely — largest single latency win |
-| AWQ 4-bit quantization, with an automatic `sdpa` attention fallback | Faster than bf16 on Ada tensor cores via fused kernels, not just smaller; the fallback keeps the system working even when `flash-attn` isn't installed (the current shipped default) |
+| Native, unquantized backbone (Section 3.3 migration off AWQ), with an automatic `sdpa` attention fallback | Drops the autoawq/gptqmodel dependency chain entirely (deprecated/unmaintained, Windows C++ build friction) while still fitting the 48GB VRAM budget comfortably; the `sdpa` fallback keeps the system working even when `flash-attn` isn't installed (the current shipped default) |
 | Prompt-based track/modality conditioning instead of long chain-of-thought | Shapes hidden reasoning without adding generation-length latency |
 | Global pre-loading + warm-up pass | Satisfies hard rule; prevents CUDA cold-start from skewing first-query latency |
 | Fine-tune on OmniMedVQA/PMC-VQA/PathVQA/VQA-RAD offline | Compliant with "no training at evaluation time"; matches heterogeneity profile of the challenge (strategy documented in Section 3; no training script ships in this repo) |

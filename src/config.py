@@ -23,22 +23,26 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 WEIGHTS_DIR = PROJECT_ROOT / "weights"
 
-MODEL_PATH = str(WEIGHTS_DIR / "qwen2-vl-7b-awq")
+MODEL_PATH = str(WEIGHTS_DIR / "qwen3-vl-4b-instruct")
 LORA_PATH = str(WEIGHTS_DIR / "lora-medvqa")
 
 # ---------------------------------------------------------------------------
 # Backbone model (Section 3.1 / 4.1)
 # ---------------------------------------------------------------------------
-BASE_MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
+# Migrated from AWQ-quantized Qwen2-VL-7B-Instruct to native (unquantized)
+# Qwen3-VL (Section 3.3): eliminates the autoawq/gptqmodel dependency chain
+# entirely -- no C++ kernel compilation required. Deployed size within the
+# Qwen3-VL line was later resized from 8B down to 4B: the 8B weights
+# (~16-17.5GB) fit the 48GB RTX 6000 Ada VRAM budget comfortably but
+# exceed the competition's strict 10GB submission file size limit; 4B
+# (~8-9GB in fp16) fits inside it, in the same model family/generation.
+# NOTE: any LoRA adapter previously trained against Qwen2-VL-7B OR
+# Qwen3-VL-8B's architecture is NOT compatible with Qwen3-VL-4B (different
+# hidden sizes/attention config per model size) and must be retrained.
+BASE_MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
 TORCH_DTYPE = torch.float16
 DEVICE = "cuda:0"
 LORA_ADAPTER_NAME = "medvqa"
-
-# AWQ 4-bit quantization config kwargs (Section 3.3 / 4.1)
-AWQ_CONFIG = {
-    "bits": 4,
-    "fuse_max_seq_len": 2048,
-}
 
 # Attention backend: prefer Flash-Attention 2, fall back to sdpa if the
 # wheel cannot be built locally (Section 4.4 / 5.4 note).

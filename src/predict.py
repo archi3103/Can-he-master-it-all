@@ -131,6 +131,11 @@ def predict(image, query: str, choices: dict) -> str:
 
         text_input = processor.apply_chat_template(messages, add_generation_prompt=True)
         inputs = processor(text=[text_input], images=[image], return_tensors="pt").to(config.DEVICE)
+        # Qwen3-VL's own usage example pops this key before generate() --
+        # Qwen3VLForConditionalGeneration.forward() doesn't accept it, and
+        # some processor code paths emit it regardless of call style. No-op
+        # if absent, so this is a safe default rather than an assumption.
+        inputs.pop("token_type_ids", None)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Pre-inference pipeline stage failed, returning fallback answer: %s", exc)
         return config.FALLBACK_ANSWER_LETTER
