@@ -75,7 +75,7 @@ def load_queries(input_dir: Path):
     if not metadata_path.is_file():
         raise FileNotFoundError(f"{METADATA_FILENAME} not found under {input_dir}")
 
-    with open(metadata_path, newline="", encoding="utf-8-sig") as f:
+    with open(metadata_path, newline="", encoding="latin1") as f:
         reader = csv.DictReader(f)
         for row in reader:
             query_id = row.get("query_id")
