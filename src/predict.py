@@ -65,7 +65,10 @@ def _run_with_timeout(fn, timeout_seconds: float):
 
 
 def _validate_choices(choices) -> bool:
-    return isinstance(choices, dict) and set(choices.keys()) == set(config.CHOICE_LETTERS)
+    if not isinstance(choices, dict):
+        return False
+    keys = set(choices.keys())
+    return any(keys == set(option) for option in config.CHOICE_SET_OPTIONS)
 
 
 def predict(image, query: str, choices: dict) -> str:
@@ -75,7 +78,9 @@ def predict(image, query: str, choices: dict) -> str:
             or file-like object is also accepted defensively and decoded
             via PIL.
         query: natural language question string.
-        choices: dict like {"A": "...", "B": "...", "C": "...", "D": "..."}.
+        choices: dict like {"A": "...", "B": "...", "C": "...", "D": "..."}
+            (4-choice MCQ), or {"A": "...", "B": "..."} for a 2-choice/
+            Yes-No question -- see config.CHOICE_SET_OPTIONS.
     Returns:
         Single character: "A", "B", "C", or "D". Never raises -- on any
         failure mode this degrades to config.FALLBACK_ANSWER_LETTER
@@ -142,9 +147,13 @@ def predict(image, query: str, choices: dict) -> str:
 
     # Stage 5+6: single forward pass + constrained decode, under a hard
     # timeout so one stalled query can't blow up the average inference
-    # time in the scoring formula.
+    # time in the scoring formula. valid_letters restricts the argmax to
+    # exactly the choices this query actually offered (2-choice/Yes-No
+    # rows never get answered "C" or "D").
+    valid_letters = list(choices.keys())
     answer = _run_with_timeout(
-        lambda: constrained_predict_letter(inputs), config.INFERENCE_TIMEOUT_SECONDS
+        lambda: constrained_predict_letter(inputs, valid_letters=valid_letters),
+        config.INFERENCE_TIMEOUT_SECONDS,
     )
     if answer is None:
         logger.warning("Inference timed out or failed, returning fallback answer")

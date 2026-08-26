@@ -339,6 +339,14 @@ CHOICE_TOKEN_VARIANTS = {
     for letter in CHOICE_LETTERS
 }
 
+# Valid *sets* of offered choice keys a query may present -- 4-choice
+# (A-D) MCQ as the default, plus 2-choice (A/B, e.g. Yes/No) rows like
+# those in dev_metadata.csv. predict.py's _validate_choices() checks
+# against these; decode.py's constrained_predict_letter() is told which
+# subset to actually consider per-query so a 2-choice question can never
+# be answered "C" or "D".
+CHOICE_SET_OPTIONS = [["A", "B"], CHOICE_LETTERS]
+
 # ---------------------------------------------------------------------------
 # Scoring-formula latency awareness: Score = Accuracy - (k * Avg Inference
 # Time). k is not known ahead of time, so this is a conservative, tunable

@@ -34,7 +34,7 @@ CHOICE_TOKEN_IDS = _get_choice_token_ids()
 
 
 @torch.inference_mode()
-def constrained_predict_letter(inputs) -> str:
+def constrained_predict_letter(inputs, valid_letters=None) -> str:
     """
     Args:
         inputs: dict of tensors from processor(...), already on the
@@ -42,16 +42,24 @@ def constrained_predict_letter(inputs) -> str:
             image + question + choices prompt with the generation
             prompt appended (i.e. ready for the model to emit the
             first answer token next).
+        valid_letters: iterable of the letters actually offered for this
+            query (e.g. ["A", "B"] for a 2-choice/Yes-No question). The
+            argmax is restricted to exactly these -- a 2-choice question
+            can never be answered "C" or "D" just because those tokens
+            happened to score higher on unrelated logits. Defaults to all
+            of CHOICE_TOKEN_IDS (i.e. "A"-"D") if omitted, preserving the
+            original 4-choice-only behavior.
 
     Returns:
-        Single character: "A", "B", "C", or "D". Deterministic /
-        greedy by construction (Section 5.5) -- no sampling involved.
+        Single character, one of `valid_letters`. Deterministic / greedy
+        by construction (Section 5.5) -- no sampling involved.
     """
     outputs = model(**inputs)
     last_logits = outputs.logits[:, -1, :]  # next-token logits, shape [1, vocab]
 
+    letters = valid_letters if valid_letters is not None else CHOICE_TOKEN_IDS.keys()
     scores = {
-        letter: max(last_logits[0, tok_id].item() for tok_id in tok_ids)
-        for letter, tok_ids in CHOICE_TOKEN_IDS.items()
+        letter: max(last_logits[0, tok_id].item() for tok_id in CHOICE_TOKEN_IDS[letter])
+        for letter in letters
     }
     return max(scores, key=scores.get)
