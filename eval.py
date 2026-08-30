@@ -31,6 +31,7 @@ same as any other predict() failure mode.
 
 import csv
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -44,6 +45,24 @@ OUTPUT_CSV_PATH = "predictions.csv"
 CHOICE_COLUMNS = ["choice_A", "choice_B", "choice_C", "choice_D"]
 
 
+def _find_duplicate_download_variant(directory: Path, stem: str, suffix: str):
+    """Matches browser-downloaded-duplicate artifacts: a file saved as
+    e.g. "0002.png" a second time commonly lands on disk as
+    "0002 (1).png". dev_metadata.csv references the bare name, so an
+    exact-match lookup alone misses every such file -- confirmed against
+    development data/, where this pattern affects the majority of rows.
+    Scans only top-level entries of `directory` (same scope as the exact
+    candidates above), matching case-insensitively since extension casing
+    isn't guaranteed either."""
+    if not directory.is_dir():
+        return None
+    pattern = re.compile(rf"^{re.escape(stem)}(?: \(\d+\))?{re.escape(suffix)}$", re.IGNORECASE)
+    for candidate in directory.iterdir():
+        if pattern.match(candidate.name):
+            return candidate
+    return None
+
+
 def _resolve_image_path(input_dir: Path, image_value: str):
     """Resolves dev_metadata.csv's `image` cell to a local path. Its exact
     prefix convention (relative to input_dir root vs. the images/
@@ -53,15 +72,23 @@ def _resolve_image_path(input_dir: Path, image_value: str):
     volumetric sample may be a directory of slices, not a single file."""
     if not image_value:
         return None
+    name = Path(image_value).name
     candidates = [
         Path(image_value) if Path(image_value).is_absolute() else None,
         input_dir / image_value,
         input_dir / IMAGES_SUBDIR / image_value,
-        input_dir / IMAGES_SUBDIR / Path(image_value).name,
+        input_dir / IMAGES_SUBDIR / name,
     ]
     for candidate in candidates:
         if candidate is not None and candidate.exists():
             return candidate
+
+    stem, suffix = Path(name).stem, Path(name).suffix
+    if suffix:  # directories (volumetric samples) never carry the download-duplicate suffix
+        for directory in (input_dir / IMAGES_SUBDIR, input_dir):
+            match = _find_duplicate_download_variant(directory, stem, suffix)
+            if match is not None:
+                return match
     return None
 
 
@@ -74,7 +101,13 @@ def load_queries(input_dir: Path):
     if not metadata_path.is_file():
         raise FileNotFoundError(f"{METADATA_FILENAME} not found under {input_dir}")
 
-    with open(metadata_path, newline="", encoding="latin1") as f:
+    # cp1252, not latin1: dev_metadata.csv (Excel/Windows-authored) uses
+    # Windows-1252 curly-quote/dash bytes (e.g. 0x92 = right single quote)
+    # that are valid-but-wrong under latin1 -- latin1 decodes every byte
+    # without error, but maps 0x92 to a stray C1 control character instead
+    # of the intended apostrophe, corrupting answer-choice text that flows
+    # straight into the model prompt.
+    with open(metadata_path, newline="", encoding="cp1252") as f:
         reader = csv.DictReader(f)
         for row in reader:
             query_id = row.get("query_id")

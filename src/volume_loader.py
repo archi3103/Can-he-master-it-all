@@ -13,7 +13,15 @@ Dispatch (see load_volume()):
     flat 2D image (.png/.jpg/...)        -> returns None; caller uses PIL as before
     .nii / .nii.gz                       -> nibabel, reoriented via as_closest_canonical
     .dcm / .dicom, or DICOM magic bytes  -> pydicom, single file
-    directory                            -> pydicom, DICOM series (all slices)
+    directory, channel-split filenames   -> PIL, RGBY channel composite (see below)
+    directory, otherwise                 -> pydicom, DICOM series (all slices)
+
+Channel-split folders: some microscopy sources (e.g. Human Protein Atlas)
+distribute a single sample as one grayscale PNG per fluorescence channel --
+"<id>_red.png", "_green.png", "_blue.png", and optionally "_yellow.png" --
+rather than as DICOM. These are NOT DICOM series (no pydicom slice would
+ever parse), so folders matching this naming convention are composited
+directly via PIL before the DICOM-series path is even attempted.
 
 Pixel-value handling (single source of correctness for HU-based windowing --
 see config.RADIOLOGY_WINDOW_LOW_PERCENTILE/HIGH_PERCENTILE, whose docstring
@@ -38,6 +46,7 @@ section).
 """
 
 import logging
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -120,6 +129,9 @@ def load_volume(path: Path) -> Optional[Image.Image]:
         raise VolumeLoadError(f"Cannot stat {path}: {exc}") from exc
 
     if is_dir:
+        channels = _find_channel_split_images(path)
+        if _REQUIRED_CHANNELS <= channels.keys():
+            return _load_channel_split_folder(path, channels)
         return _load_dicom_series(path)
 
     name_lower = path.name.lower()
@@ -230,6 +242,62 @@ def _load_nifti(path: Path) -> Image.Image:
         raise VolumeLoadError(f"NIfTI volume {path} has zero depth")
 
     return _volume_to_trislice_image(data)
+
+
+# ---------------------------------------------------------------------------
+# Channel-split microscopy folders (e.g. Human Protein Atlas RGBY exports)
+# ---------------------------------------------------------------------------
+_CHANNEL_SUFFIX_PATTERN = re.compile(r"_(red|green|blue|yellow)(?: \(\d+\))?\.\w+$", re.IGNORECASE)
+_REQUIRED_CHANNELS = {"red", "green", "blue"}
+
+
+def _find_channel_split_images(folder: Path) -> dict:
+    """Filename-only scan (no file reads) for '<id>_<channel>.<ext>'
+    members -- cheap enough to run unconditionally before deciding whether
+    a directory is a DICOM series at all. Tolerates the same duplicate-
+    download ' (<n>)' suffix eval.py's _resolve_image_path() has to
+    handle. Returns e.g. {"red": Path(...), "green": Path(...), ...};
+    missing channels are simply absent from the dict."""
+    channels = {}
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return channels
+    for f in entries:
+        if not f.is_file():
+            continue
+        match = _CHANNEL_SUFFIX_PATTERN.search(f.name)
+        if match:
+            channels.setdefault(match.group(1).lower(), f)
+    return channels
+
+
+def _load_channel_split_folder(folder: Path, channels: dict) -> Image.Image:
+    try:
+        def _read_channel(p: Path) -> np.ndarray:
+            return np.asarray(Image.open(p).convert("L"), dtype=np.float32)
+
+        red = _read_channel(channels["red"])
+        green = _read_channel(channels["green"])
+        blue = _read_channel(channels["blue"])
+        yellow = _read_channel(channels["yellow"]) if "yellow" in channels else None
+    except Exception as exc:  # noqa: BLE001 - any PIL failure means "corrupt"
+        raise VolumeLoadError(f"Cannot decode channel-split images in {folder}: {exc}") from exc
+
+    shapes = {red.shape, green.shape, blue.shape} | ({yellow.shape} if yellow is not None else set())
+    if len(shapes) > 1:
+        raise VolumeLoadError(f"Channel images in {folder} have mismatched shapes: {shapes}")
+
+    if yellow is not None:
+        # Standard RGBY->RGB composite (as used e.g. in Human Protein Atlas
+        # tooling): yellow has no channel of its own in a 3-channel image,
+        # so it's additively split half-and-half into red and green, since
+        # yellow = red + green in additive color.
+        red = red + 0.5 * yellow
+        green = green + 0.5 * yellow
+
+    rgb = np.clip(np.stack([red, green, blue], axis=-1), 0, 255).astype(np.uint8)
+    return Image.fromarray(rgb, mode="RGB")
 
 
 # ---------------------------------------------------------------------------

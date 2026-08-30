@@ -1,7 +1,8 @@
 """
-End-to-end accuracy evaluation of the full predict() pipeline (Stages 0-6,
-see src/predict.py and medical_vqa_architecture.md) against a designated
-OPEN-ACCESS subset of OmniMedVQA:
+End-to-end accuracy evaluation of the full predict_with_diagnostics()
+pipeline (Stages -1 through 6, see src/predict.py and
+medical_vqa_architecture.md) against a designated OPEN-ACCESS subset of
+OmniMedVQA:
     https://huggingface.co/datasets/foreverbeliever/OmniMedVQA
 
 Dataset structure (verified against the dataset's README):
@@ -15,7 +16,7 @@ Dataset structure (verified against the dataset's README):
 
 This script deliberately only ever reads QA_information/Open-access/ --
 Restricted-access QA items reference images not distributed in this repo,
-so they can't be run through predict() at all here. Pinning a caller-
+so they can't be run through the pipeline at all here. Pinning a caller-
 specified, fixed list of open-access dataset names (--dataset-names) also
 keeps this evaluation slice separate and reproducible from whatever gets
 used for future fine-tuning (Section 3.2 of medical_vqa_architecture.md)
@@ -30,8 +31,33 @@ handles both plausible interpretations defensively rather than guessing:
     _resolve_image_path().
   - `gt_answer`: not pinned down as the letter (A/B/C/D) vs. the answer
     text (matching one of option_A..D) -- see _resolve_gt_letter().
-A sample that can't be resolved under either interpretation is skipped
-and logged, per requirement #4, rather than silently mis-scored.
+A sample whose ground truth can't be resolved under either interpretation
+is skipped and logged (a dataset-annotation issue, not something the
+pipeline can be blindly scored against) -- this is the ONLY reason a
+sample is ever skipped. A sample whose IMAGE fails to load (corrupt file,
+unsupported volumetric format, etc.) is NOT skipped: predict_with_
+diagnostics() (src/predict.py) degrades it to a blind model call on a
+neutral gray canvas instead, so it still gets scored (almost certainly
+wrong, but that's an honest data point, not a silently dropped one).
+
+Robustness note: predict_with_diagnostics() runs the same Stage -1
+volumetric/DICOM ingest (src/volume_loader.py) as the competition path
+(src/predict.py's predict(), used by eval.py) -- a NIfTI volume, a DICOM
+file/series, or any other unreadable image is decoded or gracefully
+degraded, never crashes this script.
+
+Outputs (both always written, matching eval.py's competition contract for
+the first one):
+    predictions.csv         -- query_id, answer, inference_time (the
+                                exact 3-column format eval.py's harness
+                                writes, so this script's output is
+                                directly comparable to a real submission).
+    eval_diagnostic_log.csv -- per-sample diagnostic sidecar: query_id,
+                                answer, gold, correct, inference_time,
+                                predicted_modality, predicted_intent,
+                                n_choices, fallback_triggered,
+                                fallback_reason, top1_logit, top2_logit,
+                                logit_margin.
 
 Usage (run from the repository root):
     python src/evaluate_omnimed.py
@@ -64,7 +90,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from PIL import Image, UnidentifiedImageError  # noqa: E402
+import numpy as np  # noqa: E402 - cheap import, no model weights loaded
 
 from src import config  # noqa: E402 - cheap import, no model weights loaded
 
@@ -76,7 +102,10 @@ REPO_TYPE = "dataset"
 DEFAULT_DATASET_NAMES = ["ACRIMA"]
 DEFAULT_MAX_SAMPLES = 20
 DEFAULT_OUTPUT_CSV = "predictions.csv"
+DEFAULT_DIAGNOSTIC_CSV = "eval_diagnostic_log.csv"
 DEFAULT_SEED = 42
+BOOTSTRAP_RESAMPLES = 10000
+BOOTSTRAP_CI = 0.95
 
 _OPTION_FIELD_BY_LETTER = {letter: f"option_{letter}" for letter in config.CHOICE_LETTERS}
 
@@ -132,7 +161,9 @@ def list_available_open_access_datasets():
 def _resolve_image_path(root: Path, dataset_name: str, image_path: str):
     """`image_path`'s exact prefix convention isn't pinned down by the
     dataset README, so this tries a few plausible resolutions in order and
-    returns the first that actually exists locally, or None."""
+    returns the first that actually exists locally, or None. Uses
+    .exists() rather than .is_file() since a volumetric sample may be a
+    directory of slices (see src/volume_loader.py), not a single file."""
     if not image_path:
         return None
     candidates = [
@@ -142,7 +173,7 @@ def _resolve_image_path(root: Path, dataset_name: str, image_path: str):
         root / "Images" / dataset_name / Path(image_path).name,
     ]
     for candidate in candidates:
-        if candidate.is_file():
+        if candidate.exists():
             return candidate
     return None
 
@@ -172,11 +203,14 @@ def load_eval_samples(data_root, dataset_names, max_samples, seed, cache_dir):
     requested dataset name via the Hugging Face `datasets` library,
     shuffles deterministically (--seed) across the combined pool, and
     truncates to max_samples (None = no limit). Samples whose image file
-    can't be resolved locally are dropped here (logged), not counted as
-    evaluated.
+    can't be resolved locally are still kept (predict_with_diagnostics()
+    handles that as a blind-fallback case, not a skip -- see module
+    docstring); only unresolvable ground truth is dropped, in
+    run_evaluation() below.
 
     Returns a list of dicts: {image_path, question, choices, gt_answer,
-    modality_type, dataset, question_id}.
+    modality_type, dataset, question_id}. `image_path` is None if it
+    couldn't be resolved locally.
     """
     import datasets as hf_datasets
 
@@ -208,18 +242,25 @@ def load_eval_samples(data_root, dataset_names, max_samples, seed, cache_dir):
         records = records[:max_samples]
 
     samples = []
-    skipped_missing_image = 0
+    unresolved_image_count = 0
     for name, item in records:
+        # Only non-empty option fields become choices -- mirrors eval.py's
+        # load_queries() convention for its CSV choice_A..D columns, and
+        # matters here specifically so n_choices (2 vs. 4) reflects what
+        # was actually offered, not just which JSON keys happen to exist.
+        choices = {
+            letter: item.get(field)
+            for letter, field in _OPTION_FIELD_BY_LETTER.items()
+            if item.get(field) not in (None, "")
+        }
         image_path = _resolve_image_path(root, name, item.get("image_path", ""))
         if image_path is None:
-            skipped_missing_image += 1
+            unresolved_image_count += 1
             logger.warning(
-                "Skipping question_id=%r (dataset=%r): image_path %r not found locally.",
+                "question_id=%r (dataset=%r): image_path %r not found locally -- "
+                "will be scored via predict_with_diagnostics()'s blind gray-canvas fallback.",
                 item.get("question_id"), name, item.get("image_path"),
             )
-            continue
-
-        choices = {letter: item.get(field) for letter, field in _OPTION_FIELD_BY_LETTER.items()}
         samples.append({
             "image_path": image_path,
             "question": item.get("question", ""),
@@ -230,8 +271,11 @@ def load_eval_samples(data_root, dataset_names, max_samples, seed, cache_dir):
             "question_id": item.get("question_id"),
         })
 
-    if skipped_missing_image:
-        logger.info("Skipped %d sample(s) with unresolvable image paths before evaluation.", skipped_missing_image)
+    if unresolved_image_count:
+        logger.info(
+            "%d sample(s) have no locally resolvable image_path -- they will still be "
+            "evaluated via the blind-fallback path, not skipped.", unresolved_image_count,
+        )
 
     return samples
 
@@ -240,14 +284,19 @@ def load_eval_samples(data_root, dataset_names, max_samples, seed, cache_dir):
 # Evaluation
 # ---------------------------------------------------------------------------
 def run_evaluation(samples):
-    """Calls src.predict.predict(image, query, choices) once per sample,
-    end-to-end (Stages 0-6). Corrupt/missing images, unparseable ground
-    truth, and any exception from predict() itself are all caught here and
-    skipped rather than crashing the run (requirement #4) -- predict() is
-    documented to never raise, but this script doesn't rely on that blindly.
+    """Calls src.predict.predict_with_diagnostics(image, query, choices)
+    once per sample, end-to-end (Stages -1 through 6). The ONLY reason a
+    sample is skipped here is an unresolvable ground-truth letter (a
+    dataset-annotation problem -- there is nothing to score against).
+    Every other failure mode -- missing/corrupt/volumetric image, a Stage
+    0-4 crash, an inference timeout -- is handled inside
+    predict_with_diagnostics() itself (never raises, by design; the
+    try/except below is a defensive backstop, not load-bearing) and still
+    produces a scored row, with fallback_triggered/fallback_reason
+    recording what happened.
 
     Returns (results, skipped_count)."""
-    from src.predict import predict  # deferred: this import triggers the full
+    from src.predict import predict_with_diagnostics  # deferred: this import triggers the full
     # model/weights load (Section 4.1) -- keep --list-datasets/--help cheap.
 
     results = []
@@ -262,34 +311,37 @@ def run_evaluation(samples):
             skipped += 1
             continue
 
+        # sample["image_path"] may be None (unresolvable locally) --
+        # predict_with_diagnostics() treats that exactly like any other
+        # unreadable image (Image.open(None) raises TypeError, caught by
+        # its broad except around _load_input_image) and degrades to the
+        # blind gray-canvas path.
         try:
-            image = Image.open(sample["image_path"])
-            image.load()
-        except (UnidentifiedImageError, OSError, ValueError) as exc:
-            logger.warning(
-                "Skipping question_id=%r: corrupt/unreadable image %s (%s)",
-                sample["question_id"], sample["image_path"], exc,
+            diag = predict_with_diagnostics(sample["image_path"], sample["question"], sample["choices"])
+        except Exception as exc:  # noqa: BLE001 - predict_with_diagnostics() shouldn't raise, but this boundary must never crash the run
+            logger.exception(
+                "predict_with_diagnostics() raised unexpectedly for question_id=%r: %s",
+                sample["question_id"], exc,
             )
             skipped += 1
             continue
 
-        try:
-            t0 = time.perf_counter()
-            predicted = predict(image, sample["question"], sample["choices"])
-            elapsed = time.perf_counter() - t0
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Skipping question_id=%r: predict() raised %s", sample["question_id"], exc)
-            skipped += 1
-            continue
-
         results.append({
-            "question_id": sample["question_id"],
+            "query_id": sample["question_id"],
             "dataset": sample["dataset"],
             "modality_type": sample["modality_type"],
-            "predicted": predicted,
-            "gt_letter": gt_letter,
-            "correct": predicted == gt_letter,
-            "inference_time": elapsed,
+            "n_choices": len(sample["choices"]),
+            "answer": diag["answer"],
+            "gold": gt_letter,
+            "correct": diag["answer"] == gt_letter,
+            "inference_time": diag["inference_time"],
+            "predicted_modality": diag["modality"],
+            "predicted_intent": diag["track"],
+            "fallback_triggered": diag["fallback_triggered"],
+            "fallback_reason": diag["fallback_reason"] or "",
+            "top1_logit": diag["top1_logit"],
+            "top2_logit": diag["top2_logit"],
+            "logit_margin": diag["logit_margin"],
         })
 
     return results, skipped
@@ -298,51 +350,106 @@ def run_evaluation(samples):
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+def _bootstrap_ci(correct_flags, n_resamples=BOOTSTRAP_RESAMPLES, ci=BOOTSTRAP_CI, seed=DEFAULT_SEED):
+    """Percentile bootstrap CI on exact-match accuracy: resamples the
+    per-item correct/incorrect vector with replacement n_resamples times
+    and takes the (1-ci)/2 / (1+ci)/2 percentiles of the resampled means.
+    Returns (lo_pct, hi_pct). Deterministic given `seed`, independent of
+    the sample-selection --seed."""
+    arr = np.asarray(correct_flags, dtype=np.float64)
+    if arr.size == 0:
+        return 0.0, 0.0
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, arr.size, size=(n_resamples, arr.size))
+    resampled_means = arr[idx].mean(axis=1)
+    alpha = (1.0 - ci) / 2.0
+    lo = float(np.percentile(resampled_means, alpha * 100.0))
+    hi = float(np.percentile(resampled_means, (1.0 - alpha) * 100.0))
+    return lo * 100.0, hi * 100.0
+
+
+def _stratify(results, key_fn):
+    buckets = defaultdict(lambda: {"correct": 0, "total": 0})
+    for r in results:
+        bucket = buckets[key_fn(r)]
+        bucket["total"] += 1
+        bucket["correct"] += int(r["correct"])
+    return buckets
+
+
+def _print_stratification(title, buckets):
+    print(f"\n{title}")
+    print("-" * 60)
+    print(f"{'Group':<30}{'Correct/Total':<15}{'Accuracy':>10}")
+    print("-" * 60)
+    for key in sorted(buckets, key=lambda k: -buckets[k]["total"]):
+        stats = buckets[key]
+        acc = 100.0 * stats["correct"] / stats["total"] if stats["total"] else 0.0
+        ratio = f"{stats['correct']}/{stats['total']}"
+        print(f"{str(key):<30}{ratio:<15}{acc:>9.2f}%")
+
+
 def print_report(results, skipped, total_requested):
     if not results:
         print("\nNo samples were successfully evaluated.")
         return
 
     total = len(results)
-    correct = sum(r["correct"] for r in results)
+    correct_flags = [r["correct"] for r in results]
+    correct = sum(correct_flags)
     accuracy = 100.0 * correct / total
+    ci_lo, ci_hi = _bootstrap_ci(correct_flags)
     avg_time = sum(r["inference_time"] for r in results) / total
+    fallback_count = sum(r["fallback_triggered"] for r in results)
+    fallback_rate = 100.0 * fallback_count / total
 
     print("\n" + "=" * 60)
     print("OmniMedVQA End-to-End Evaluation")
     print("=" * 60)
-    print(f"Requested samples:                      {total_requested}")
-    print(f"Evaluated:                               {total}")
-    print(f"Skipped (corrupt/missing/unresolvable):  {skipped}")
-    print(f"Overall accuracy:                        {accuracy:.2f}% ({correct}/{total})")
-    print(f"Avg inference time:                      {avg_time:.4f}s")
+    print(f"Requested samples:                        {total_requested}")
+    print(f"Evaluated:                                 {total}")
+    print(f"Skipped (unresolvable ground truth):       {skipped}")
+    print(f"Overall Exact-Match accuracy:               {accuracy:.2f}% ({correct}/{total})")
+    print(f"  {int(BOOTSTRAP_CI * 100)}% bootstrap CI ({BOOTSTRAP_RESAMPLES:,} resamples):  [{ci_lo:.2f}%, {ci_hi:.2f}%]")
+    print(f"Fallback rate (blind/degraded answers):     {fallback_rate:.2f}% ({fallback_count}/{total})")
+    print(f"Avg inference time:                         {avg_time:.4f}s")
 
-    per_modality = defaultdict(lambda: {"correct": 0, "total": 0})
-    for r in results:
-        bucket = per_modality[r["modality_type"]]
-        bucket["total"] += 1
-        bucket["correct"] += int(r["correct"])
-
-    print("\nPer-Modality Performance")
-    print("-" * 60)
-    print(f"{'Modality':<35}{'Correct/Total':<15}{'Accuracy':>10}")
-    print("-" * 60)
-    for modality in sorted(per_modality, key=lambda m: -per_modality[m]["total"]):
-        stats = per_modality[modality]
-        acc = 100.0 * stats["correct"] / stats["total"] if stats["total"] else 0.0
-        ratio = f"{stats['correct']}/{stats['total']}"
-        print(f"{modality:<35}{ratio:<15}{acc:>9.2f}%")
+    _print_stratification(
+        "Accuracy by Modality (ground truth modality_type)",
+        _stratify(results, lambda r: r["modality_type"]),
+    )
+    _print_stratification(
+        "Accuracy by Number of Choices",
+        _stratify(results, lambda r: r["n_choices"]),
+    )
     print("=" * 60)
 
 
-def _write_csv(results, path):
+def _write_submission_csv(results, path):
+    """query_id, answer, inference_time -- the exact 3-column format
+    eval.py's competition harness writes, so this file is directly
+    comparable to (or droppable in as) a real submission."""
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["question_id", "dataset", "modality_type", "predicted", "gt_letter", "correct", "inference_time"]
-        )
+        writer = csv.writer(f)
+        writer.writerow(["query_id", "answer", "inference_time"])
+        for r in results:
+            writer.writerow([r["query_id"], r["answer"], f"{r['inference_time']:.4f}"])
+
+
+_DIAGNOSTIC_FIELDNAMES = [
+    "query_id", "answer", "gold", "correct", "inference_time",
+    "predicted_modality", "predicted_intent", "n_choices",
+    "fallback_triggered", "fallback_reason",
+    "top1_logit", "top2_logit", "logit_margin",
+]
+
+
+def _write_diagnostic_csv(results, path):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_DIAGNOSTIC_FIELDNAMES)
         writer.writeheader()
         for r in results:
-            writer.writerow(r)
+            writer.writerow({name: r.get(name, "") for name in _DIAGNOSTIC_FIELDNAMES})
 
 
 # ---------------------------------------------------------------------------
@@ -350,9 +457,9 @@ def _write_csv(results, path):
 # ---------------------------------------------------------------------------
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="End-to-end accuracy evaluation of src.predict.predict() against the "
-                     "Open-access subset of OmniMedVQA (foreverbeliever/OmniMedVQA on the "
-                     "Hugging Face Hub)."
+        description="End-to-end accuracy evaluation of src.predict.predict_with_diagnostics() "
+                     "against the Open-access subset of OmniMedVQA (foreverbeliever/OmniMedVQA "
+                     "on the Hugging Face Hub)."
     )
     parser.add_argument(
         "--dataset-names", nargs="+", default=DEFAULT_DATASET_NAMES,
@@ -373,9 +480,14 @@ def build_arg_parser():
     parser.add_argument("--cache-dir", type=str, default=None, help="huggingface_hub cache directory override.")
     parser.add_argument(
         "--output-csv", type=str, default=DEFAULT_OUTPUT_CSV,
-        help=f"Path to write a per-sample results CSV, relative to the current working "
-             f"directory. Default: {DEFAULT_OUTPUT_CSV!r} (always written, matching "
-             "run_predictions.py's convention). Pass an empty string to skip writing one.",
+        help=f"Path to write the standard submission-format CSV (query_id, answer, "
+             f"inference_time), relative to the current working directory. Default: "
+             f"{DEFAULT_OUTPUT_CSV!r}. Pass an empty string to skip writing it.",
+    )
+    parser.add_argument(
+        "--diagnostic-csv", type=str, default=DEFAULT_DIAGNOSTIC_CSV,
+        help=f"Path to write the rich per-sample diagnostic sidecar CSV. Default: "
+             f"{DEFAULT_DIAGNOSTIC_CSV!r}. Pass an empty string to skip writing it.",
     )
     parser.add_argument(
         "--list-datasets", action="store_true",
@@ -400,13 +512,19 @@ def main():
         logger.error("No evaluable samples found -- nothing to run.")
         sys.exit(1)
 
-    logger.info("Loaded %d sample(s); loading the predict() pipeline (this triggers the full model load)...", len(samples))
+    logger.info(
+        "Loaded %d sample(s); loading the predict pipeline (this triggers the full model load)...",
+        len(samples),
+    )
     results, skipped = run_evaluation(samples)
     print_report(results, skipped, total_requested=len(samples))
 
     if args.output_csv:
-        _write_csv(results, args.output_csv)
-        logger.info("Per-sample results written to %s", Path(args.output_csv).resolve())
+        _write_submission_csv(results, args.output_csv)
+        logger.info("Submission-format predictions written to %s", Path(args.output_csv).resolve())
+    if args.diagnostic_csv:
+        _write_diagnostic_csv(results, args.diagnostic_csv)
+        logger.info("Diagnostic sidecar log written to %s", Path(args.diagnostic_csv).resolve())
 
 
 if __name__ == "__main__":

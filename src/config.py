@@ -376,3 +376,16 @@ LATENCY_PENALTY_K = None  # set once k is known/estimated via validation
 # ---------------------------------------------------------------------------
 INFERENCE_TIMEOUT_SECONDS = 5.0
 FALLBACK_ANSWER_LETTER = "A"
+
+# ---------------------------------------------------------------------------
+# Blind-fallback support (src/predict.py's predict_with_diagnostics(), used
+# by src/evaluate_omnimed.py). When the real image can't be loaded/decoded
+# at all, a neutral mid-gray canvas of this size is substituted and run
+# through the full pipeline instead of skipping straight to
+# FALLBACK_ANSWER_LETTER -- lets the model still reason from the question
+# text and choices alone rather than answering fully blind. Not used by
+# predict()/eval.py's competition path, which keeps its original
+# immediate-fallback behavior unchanged.
+# ---------------------------------------------------------------------------
+BLIND_FALLBACK_IMAGE_SIZE = (512, 512)
+BLIND_FALLBACK_GRAY_VALUE = 128

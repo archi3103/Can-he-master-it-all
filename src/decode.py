@@ -34,7 +34,7 @@ CHOICE_TOKEN_IDS = _get_choice_token_ids()
 
 
 @torch.inference_mode()
-def constrained_predict_letter(inputs, valid_letters=None) -> str:
+def constrained_predict_with_scores(inputs, valid_letters=None) -> tuple:
     """
     Args:
         inputs: dict of tensors from processor(...), already on the
@@ -51,8 +51,13 @@ def constrained_predict_letter(inputs, valid_letters=None) -> str:
             original 4-choice-only behavior.
 
     Returns:
-        Single character, one of `valid_letters`. Deterministic / greedy
-        by construction (Section 5.5) -- no sampling involved.
+        (letter, scores) -- `letter` is a single character, one of
+        `valid_letters`, deterministic/greedy by construction (Section
+        5.5, no sampling involved). `scores` is the full {letter: logit}
+        dict the argmax was taken over, exposed so callers that need more
+        than the winning letter (e.g. confidence diagnostics -- see
+        src/evaluate_omnimed.py's diagnostic sidecar log) don't need a
+        second forward pass.
     """
     outputs = model(**inputs)
     last_logits = outputs.logits[:, -1, :]  # next-token logits, shape [1, vocab]
@@ -62,4 +67,11 @@ def constrained_predict_letter(inputs, valid_letters=None) -> str:
         letter: max(last_logits[0, tok_id].item() for tok_id in CHOICE_TOKEN_IDS[letter])
         for letter in letters
     }
-    return max(scores, key=scores.get)
+    return max(scores, key=scores.get), scores
+
+
+def constrained_predict_letter(inputs, valid_letters=None) -> str:
+    """Convenience wrapper over constrained_predict_with_scores() for
+    callers that only need the winning letter (src/predict.py's predict())."""
+    letter, _ = constrained_predict_with_scores(inputs, valid_letters=valid_letters)
+    return letter

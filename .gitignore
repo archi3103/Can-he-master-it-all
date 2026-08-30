@@ -26,6 +26,7 @@ dist/
 weights/
 data/
 predictions.csv
+development data/
 
 # OS specific files
 Thumbs.db
