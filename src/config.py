@@ -65,6 +65,23 @@ MIN_PIXELS = 256 * 256
 MAX_PIXELS = 1024 * 1024
 
 # ---------------------------------------------------------------------------
+# Stage -1: Volumetric/DICOM ingest (src/volume_loader.py)
+# ---------------------------------------------------------------------------
+# Runs before Stage 0 (universal_normalize) and before PIL ever touches the
+# file. Decodes 3D NIfTI volumes, single DICOM files, multi-frame DICOM
+# files, and DICOM series folders into a single 2D RGB image; flat 2D
+# images (.png/.jpg/etc.) pass straight through untouched.
+#
+# Slice-selection policy: three slices at these relative depths are
+# extracted and tiled into one 1x3 composite, rather than picking one
+# arbitrary slice (risks landing on an uninformative edge slice) or
+# decoding the whole volume (the VLM only accepts a single 2D image, so
+# most of that work would be wasted). Cheap heuristic, not a learned
+# key-slice selector -- consistent with this codebase's latency-first
+# design elsewhere (see the feature-flag section below).
+VOLUME_TRISLICE_DEPTH_FRACTIONS = (0.35, 0.50, 0.65)
+
+# ---------------------------------------------------------------------------
 # Stage 2: Modality-specific preprocessing (Section 1.2)
 # ---------------------------------------------------------------------------
 # Bumped whenever the preprocessing heuristics/tunables below change in a

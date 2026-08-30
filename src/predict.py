@@ -2,6 +2,9 @@
 Top-level predict() entry point (Section 5.2 of medical_vqa_architecture.md),
 wiring together every pipeline stage:
 
+    Stage -1 (src/volume_loader.py)   -> volumetric/DICOM ingest (NIfTI,
+                                          single/multi-frame DICOM, DICOM
+                                          series folders) into a 2D RGB image
     Stage 0 (src/preprocessing.py)    -> universal_normalize() (RGBA/alpha
                                           stripping, 16-bit/float stretch)
     Stage 1 (src/router_modality.py)  -> route_modality(): coarse stream +
@@ -22,6 +25,7 @@ scoring formula.
 
 import logging
 import threading
+from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
@@ -36,6 +40,7 @@ from src.router_intent import detect_track
 from src.preprocessing import preprocess_image, universal_normalize
 from src.prompt_builder import build_system_prompt
 from src.decode import constrained_predict_letter
+from src.volume_loader import load_volume, VolumeLoadError
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +80,10 @@ def predict(image, query: str, choices: dict) -> str:
     """
     Args:
         image: PIL Image (raw medical image, arbitrary modality). A path
-            or file-like object is also accepted defensively and decoded
-            via PIL.
+            or file-like object is also accepted defensively -- a path to
+            a NIfTI volume, a single/multi-frame DICOM file, or a folder of
+            DICOM slices is decoded by Stage -1 (src/volume_loader.py);
+            anything else is decoded via PIL as before.
         query: natural language question string.
         choices: dict like {"A": "...", "B": "...", "C": "...", "D": "..."}
             (4-choice MCQ), or {"A": "...", "B": "..."} for a 2-choice/
@@ -86,6 +93,25 @@ def predict(image, query: str, choices: dict) -> str:
         failure mode this degrades to config.FALLBACK_ANSWER_LETTER
         rather than crashing the harness (Section 5.5).
     """
+    # --- Stage -1: volumetric/DICOM ingest ---
+    # Must run before PIL ever touches the path: PIL cannot decode NIfTI or
+    # DICOM at all, and would otherwise just raise straight into the
+    # corrupt-image guard below, discarding the scan with no real analysis
+    # (see eval.py's former KNOWN LIMITATION note). Only attempted for
+    # path-like inputs -- an already-decoded PIL.Image is passed through
+    # untouched, same as before.
+    try:
+        if isinstance(image, (str, Path)):
+            volume_image = load_volume(Path(image))
+            if volume_image is not None:
+                image = volume_image
+    except VolumeLoadError as exc:
+        logger.warning("Unreadable volumetric/DICOM input, returning fallback answer: %s", exc)
+        return config.FALLBACK_ANSWER_LETTER
+    except Exception as exc:  # noqa: BLE001 - defensive backstop, volume ingest must never crash the run
+        logger.exception("Volume loader raised unexpectedly, returning fallback answer: %s", exc)
+        return config.FALLBACK_ANSWER_LETTER
+
     # --- Corrupt/unreadable image guard ---
     try:
         if not isinstance(image, Image.Image):

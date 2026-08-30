@@ -20,14 +20,13 @@ images or any predict() failure degrade to config.FALLBACK_ANSWER_LETTER
 rather than skipping the row or crashing the run (Section 5.5), since a
 missing row would presumably be scored as wrong by the harness anyway.
 
-KNOWN LIMITATION: image resolution below only locates the file/folder on
-disk; it does not decode .nii (NIfTI) or .dcm (DICOM) volumes, nor select
-a slice from a folder of sliced data. predict()'s existing corrupt-image
-guard (PIL can't open these formats) already prevents a crash on them --
-such rows fall back to config.FALLBACK_ANSWER_LETTER, answered "blind"
-with no real image analysis. That's a real accuracy gap, not a bug, and
-building real volumetric/DICOM support is a separate, deliberately
-undecided piece of work (see the chat discussion this file came out of).
+Image resolution below (_resolve_image_path) only locates the file/folder
+on disk; the actual decoding of .nii/.nii.gz (NIfTI) volumes, .dcm (DICOM)
+files, and folders of DICOM slices happens in predict()'s Stage -1
+(src/volume_loader.py), which runs before PIL ever touches the path. A
+volumetric/DICOM input that is genuinely corrupt or unreadable still
+degrades to config.FALLBACK_ANSWER_LETTER rather than crashing the run,
+same as any other predict() failure mode.
 """
 
 import csv
