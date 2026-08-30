@@ -1,7 +1,5 @@
 """
-End-to-end accuracy evaluation of the full predict_with_diagnostics()
-pipeline (Stages -1 through 6, see src/predict.py and
-medical_vqa_architecture.md) against a designated OPEN-ACCESS subset of
+End-to-end accuracy evaluation against a designated OPEN-ACCESS subset of
 OmniMedVQA, read directly from a local directory mirror (e.g. a Google
 Drive folder mounted in Colab) -- NOT downloaded from the Hugging Face
 Hub. Point --data-root at a local copy laid out like:
@@ -37,16 +35,31 @@ is skipped and logged (a dataset-annotation issue, not something the
 pipeline can be blindly scored against) -- this is the ONLY reason a
 sample is ever skipped. A sample whose IMAGE fails to load (corrupt file,
 unsupported volumetric format, unresolvable path, etc.) is NOT skipped:
-predict_with_diagnostics() (src/predict.py) degrades it to a blind model
-call on a neutral gray canvas instead, so it still gets scored (almost
-certainly wrong, but that's an honest data point, not a silently dropped
-one).
+both scorers below degrade it to a blind model call on a neutral gray
+canvas instead, so it still gets scored (almost certainly wrong, but
+that's an honest data point, not a silently dropped one).
 
-Robustness note: predict_with_diagnostics() runs the same Stage -1
-volumetric/DICOM ingest (src/volume_loader.py) as the competition path
-(src/predict.py's predict(), used by eval.py) -- a NIfTI volume, a DICOM
-file/series, or any other unreadable image is decoded or gracefully
-degraded, never crashes this script.
+Scoring method (--scoring-method, see src/predict.py):
+  - "pipeline" (default): src.predict.predict_with_diagnostics() -- our
+    own Stage 6 single-token letter-argmax decoding (src/decode.py).
+    Fast (one forward pass per query), but NOT the metric OmniMedVQA's
+    own paper/leaderboard reports.
+  - "prefix_score": src.predict.predict_by_prefix_score() -- a
+    replication of OmniMedVQA's own published "Prefix-based Score"
+    methodology (src/prefix_score.py, read directly from the paper's own
+    eval code at OpenGVLab/Multi-Modality-Arena): one forward pass per
+    candidate option, scored by mean cross-entropy loss of the full
+    option text (not just its letter) as a continuation of a plain
+    "Question: ... The answer is" prompt with no options listed. This is
+    the number directly comparable to the paper's/leaderboard's MCQ
+    column -- use this one for a SOTA comparison. Roughly n_choices x
+    slower per query than "pipeline" (2-4 forward passes instead of 1).
+
+Robustness note: both scorers run the same Stage -1 volumetric/DICOM
+ingest (src/volume_loader.py) as the competition path (src/predict.py's
+predict(), used by eval.py) -- a NIfTI volume, a DICOM file/series, or
+any other unreadable image is decoded or gracefully degraded, never
+crashes this script.
 
 Outputs (both always written, matching eval.py's competition contract for
 the first one):
@@ -283,21 +296,39 @@ def load_omnimed_samples(data_root, dataset_names, max_samples, seed):
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
-def run_evaluation(samples):
-    """Calls src.predict.predict_with_diagnostics(image, query, choices)
-    once per sample, end-to-end (Stages -1 through 6). The ONLY reason a
-    sample is skipped here is an unresolvable ground-truth letter (a
-    dataset-annotation problem -- there is nothing to score against).
-    Every other failure mode -- missing/corrupt/volumetric image, a Stage
-    0-4 crash, an inference timeout -- is handled inside
-    predict_with_diagnostics() itself (never raises, by design; the
-    try/except below is a defensive backstop, not load-bearing) and still
-    produces a scored row, with fallback_triggered/fallback_reason
-    recording what happened.
+def run_evaluation(samples, scoring_method="pipeline"):
+    """Calls one of src.predict's diagnostics-returning entry points once
+    per sample, end-to-end (Stages -1 through 6, or -1/0/1/2 + Prefix-
+    Score for the "prefix_score" method -- see Args below). The ONLY
+    reason a sample is skipped here is an unresolvable ground-truth
+    letter (a dataset-annotation problem -- there is nothing to score
+    against). Every other failure mode -- missing/corrupt/volumetric
+    image, a pipeline-stage crash, an inference timeout -- is handled
+    inside the scorer itself (never raises, by design; the try/except
+    below is a defensive backstop, not load-bearing) and still produces a
+    scored row, with fallback_triggered/fallback_reason recording what
+    happened.
+
+    Args:
+        scoring_method: "pipeline" (default) scores via
+            src.predict.predict_with_diagnostics() -- our own Stage 6
+            single-token letter-argmax decoding (src/decode.py). Fast,
+            but NOT the metric OmniMedVQA's own leaderboard reports.
+            "prefix_score" scores via src.predict.predict_by_prefix_score()
+            -- a replication of OmniMedVQA's own published "Prefix-based
+            Score" methodology (src/prefix_score.py): one forward pass
+            per candidate option, scored by mean cross-entropy loss of
+            the full option text. This is the number actually comparable
+            to the paper's/leaderboard's MCQ column, at the cost of
+            roughly {n_choices}x the forward passes per query.
 
     Returns (results, skipped_count)."""
-    from src.predict import predict_with_diagnostics  # deferred: this import triggers the full
-    # model/weights load (Section 4.1) -- keep --list-datasets/--help cheap.
+    # Deferred: this import triggers the full model/weights load
+    # (Section 4.1) -- keep --list-datasets/--help cheap.
+    if scoring_method == "prefix_score":
+        from src.predict import predict_by_prefix_score as scorer
+    else:
+        from src.predict import predict_with_diagnostics as scorer
 
     results = []
     skipped = 0
@@ -311,17 +342,17 @@ def run_evaluation(samples):
             skipped += 1
             continue
 
-        # sample["image_path"] may be None (unresolvable locally) --
-        # predict_with_diagnostics() treats that exactly like any other
-        # unreadable image (Image.open(None) raises TypeError, caught by
-        # its broad except around _load_input_image) and degrades to the
-        # blind gray-canvas path.
+        # sample["image_path"] may be None (unresolvable locally) -- both
+        # scorers treat that exactly like any other unreadable image
+        # (Image.open(None) raises TypeError, caught by their broad
+        # except around _load_input_image) and degrade to the blind
+        # gray-canvas path rather than skipping the sample.
         try:
-            diag = predict_with_diagnostics(sample["image_path"], sample["question"], sample["choices"])
-        except Exception as exc:  # noqa: BLE001 - predict_with_diagnostics() shouldn't raise, but this boundary must never crash the run
+            diag = scorer(sample["image_path"], sample["question"], sample["choices"])
+        except Exception as exc:  # noqa: BLE001 - the scorer shouldn't raise, but this boundary must never crash the run
             logger.exception(
-                "predict_with_diagnostics() raised unexpectedly for question_id=%r: %s",
-                sample["question_id"], exc,
+                "%s() raised unexpectedly for question_id=%r: %s",
+                scorer.__name__, sample["question_id"], exc,
             )
             skipped += 1
             continue
@@ -495,6 +526,15 @@ def build_arg_parser():
         help="List Open-access dataset names present under --data-root and exit "
              "(no evaluation, no model load).",
     )
+    parser.add_argument(
+        "--scoring-method", choices=["pipeline", "prefix_score"], default="pipeline",
+        help="'pipeline' (default): our own Stage 6 single-token letter-argmax decoding "
+             "(src/decode.py) -- fast, but NOT the metric OmniMedVQA's own paper/leaderboard "
+             "reports. 'prefix_score': replicates OmniMedVQA's own published Prefix-based "
+             "Score methodology (src/prefix_score.py) -- one forward pass per candidate "
+             "option (roughly n_choices x slower per query), directly comparable to the "
+             "paper's/leaderboard's MCQ column.",
+    )
     return parser
 
 
@@ -515,10 +555,10 @@ def main():
         sys.exit(1)
 
     logger.info(
-        "Loaded %d sample(s); loading the predict pipeline (this triggers the full model load)...",
-        len(samples),
+        "Loaded %d sample(s); loading the predict pipeline (this triggers the full model load)... "
+        "scoring_method=%r", len(samples), args.scoring_method,
     )
-    results, skipped = run_evaluation(samples)
+    results, skipped = run_evaluation(samples, scoring_method=args.scoring_method)
     print_report(results, skipped, total_requested=len(samples))
 
     if args.output_csv:

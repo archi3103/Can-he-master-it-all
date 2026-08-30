@@ -22,17 +22,29 @@ degrades to config.FALLBACK_ANSWER_LETTER instead, so one bad query can't
 crash the harness or blow up the average-inference-time term of the
 scoring formula.
 
-Two public entry points share the Stage-wiring helpers below
-(_load_input_image, _run_pipeline):
+Three public entry points share the Stage-wiring helpers below
+(_load_input_image, _run_pipeline, _neutral_gray_canvas, _diagnostic_result):
     predict(image, query, choices) -> str
         The competition path (used by eval.py). Unchanged behavior: any
         failure mode degrades immediately to config.FALLBACK_ANSWER_LETTER.
     predict_with_diagnostics(image, query, choices) -> dict
-        Used by src/evaluate_omnimed.py. On an unreadable/unloadable image
-        (or a Stage 0-4 crash), retries once on a neutral gray canvas
-        instead of answering fully blind, and returns a rich diagnostics
-        dict (modality, track, per-choice logits, fallback reason, etc.)
-        instead of just the winning letter.
+        Used by src/evaluate_omnimed.py's default --scoring-method
+        (pipeline). On an unreadable/unloadable image (or a Stage 0-4
+        crash), retries once on a neutral gray canvas instead of
+        answering fully blind, and returns a rich diagnostics dict
+        (modality, track, per-choice logits, fallback reason, etc.)
+        instead of just the winning letter. Uses Stage 6's single-token
+        letter-argmax decoding (src/decode.py) -- fast, but not the
+        metric OmniMedVQA's own leaderboard reports.
+    predict_by_prefix_score(image, query, choices) -> dict
+        Used by src/evaluate_omnimed.py's --scoring-method prefix_score.
+        Same Stage -1/0/1/2 handling and blind-fallback behavior as
+        predict_with_diagnostics(), but Stages 3-6 are replaced with a
+        replication of OmniMedVQA's own published "Prefix-based Score"
+        methodology (src/prefix_score.py) -- one forward pass per
+        candidate option, scored by mean cross-entropy loss of the full
+        option text, not just its letter. This is the number actually
+        comparable to the paper's/leaderboard's MCQ column.
 """
 
 import logging
@@ -370,5 +382,107 @@ def predict_with_diagnostics(image, query: str, choices: dict) -> dict:
     return _diagnostic_result(
         elapsed, answer=result["answer"], modality=result["modality"], subtype=result["subtype"],
         track=result["track"], fallback_triggered=fallback_triggered, fallback_reason=fallback_reason,
+        top1_logit=top1_logit, top2_logit=top2_logit, logit_margin=logit_margin,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prefix-Score variant -- used by src/evaluate_omnimed.py's
+# --scoring-method prefix_score, to report a number comparable to
+# OmniMedVQA's own published leaderboard (see src/prefix_score.py's
+# module docstring for the full reference methodology, read directly from
+# the paper's own eval code). NOT used by the competition path
+# (predict()) or by the default pipeline-scorer diagnostics
+# (predict_with_diagnostics() above, which uses Stage 6's single-token
+# letter argmax -- a different, faster, but not paper-comparable metric).
+# ---------------------------------------------------------------------------
+def predict_by_prefix_score(image, query: str, choices: dict) -> dict:
+    """
+    Like predict_with_diagnostics(), but scores each candidate option's
+    full TEXT via OmniMedVQA's "Prefix-based Score" methodology (mean
+    cross-entropy loss of the option text as a continuation of a plain
+    "Question: ... The answer is" prompt -- no options listed, no
+    track/system-prompt persona -- see src/prefix_score.py) instead of
+    Stage 6's single-token letter-argmax decoding. Stages -1, 0, 1, 2 run
+    unchanged (volumetric ingest, blind gray-canvas fallback on a load or
+    preprocessing failure, modality routing, subtype-specific
+    preprocessing); Stages 3-6 are replaced entirely -- there is no
+    track/system-prompt (the reference methodology never uses one) and no
+    single-pass timeout guard (each candidate is its own fast forward
+    pass; a stuck one would already show up as unresponsive process,
+    same as any other hang, rather than needing a bespoke guard).
+
+    Returns a dict with the same shape as predict_with_diagnostics():
+    answer, modality, subtype, track (always None here -- no intent
+    detection in this methodology), fallback_triggered, fallback_reason,
+    top1_logit, top2_logit, logit_margin (these three are NEGATED losses,
+    so "higher is better" like the other scorer's real logits -- directly
+    comparable in sign/ordering, not in absolute scale), inference_time.
+    Never raises.
+    """
+    from src.prefix_score import score_choices_by_prefix_loss
+
+    t0 = time.perf_counter()
+
+    if not _validate_choices(choices):
+        logger.warning("Malformed choices dict %r, returning fallback answer", choices)
+        return _diagnostic_result(
+            time.perf_counter() - t0,
+            fallback_triggered=True, fallback_reason=_REASON_MALFORMED_CHOICES,
+        )
+
+    fallback_triggered = False
+    fallback_reason = None
+    try:
+        loaded_image = _load_input_image(image)
+    except Exception as exc:  # noqa: BLE001 - any load failure triggers the blind fallback below
+        logger.warning(
+            "Image load failed (%s: %s), falling back to a blind model call on a neutral gray canvas",
+            type(exc).__name__, exc,
+        )
+        fallback_triggered = True
+        fallback_reason = _REASON_IMAGE_LOAD_FAILED
+        loaded_image = _neutral_gray_canvas()
+
+    def _run(image_for_scoring):
+        normalized = universal_normalize(image_for_scoring)
+        modality, subtype = route_modality(normalized)
+        prepped = preprocess_image(normalized, modality, subtype)
+        losses = score_choices_by_prefix_loss(prepped, query, choices)
+        return modality, subtype, losses
+
+    try:
+        modality, subtype, losses = _run(loaded_image)
+    except Exception as exc:  # noqa: BLE001
+        if fallback_triggered:
+            logger.exception("Pipeline failed even on the gray-canvas fallback, returning fallback answer: %s", exc)
+            return _diagnostic_result(
+                time.perf_counter() - t0,
+                fallback_triggered=True, fallback_reason=_REASON_PIPELINE_FAILED_ON_GRAY_CANVAS,
+            )
+        logger.warning(
+            "Pipeline stage failed (%s), retrying with a blind model call on a neutral gray canvas", exc
+        )
+        fallback_triggered = True
+        fallback_reason = _REASON_PIPELINE_STAGE_FAILED
+        try:
+            modality, subtype, losses = _run(_neutral_gray_canvas())
+        except Exception as retry_exc:  # noqa: BLE001
+            logger.exception("Pipeline failed even on the gray-canvas retry, returning fallback answer: %s", retry_exc)
+            return _diagnostic_result(
+                time.perf_counter() - t0,
+                fallback_triggered=True, fallback_reason=_REASON_PIPELINE_FAILED_ON_GRAY_CANVAS,
+            )
+
+    elapsed = time.perf_counter() - t0
+    answer = min(losses, key=losses.get)
+    ranked = sorted(losses.values())  # ascending -- lowest loss (best) first
+    top1_logit = -ranked[0]
+    top2_logit = -ranked[1] if len(ranked) > 1 else None
+    logit_margin = (top1_logit - top2_logit) if top2_logit is not None else None
+
+    return _diagnostic_result(
+        elapsed, answer=answer, modality=modality, subtype=subtype, track=None,
+        fallback_triggered=fallback_triggered, fallback_reason=fallback_reason,
         top1_logit=top1_logit, top2_logit=top2_logit, logit_margin=logit_margin,
     )
