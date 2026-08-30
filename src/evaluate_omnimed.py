@@ -2,32 +2,33 @@
 End-to-end accuracy evaluation of the full predict_with_diagnostics()
 pipeline (Stages -1 through 6, see src/predict.py and
 medical_vqa_architecture.md) against a designated OPEN-ACCESS subset of
-OmniMedVQA:
-    https://huggingface.co/datasets/foreverbeliever/OmniMedVQA
-
-Dataset structure (verified against the dataset's README):
-    Images/<DatasetName>/...                             -- open-access images only
-    QA_information/Open-access/<DatasetName>.json         -- QA items whose images
-                                                               are actually available
-    QA_information/Restricted-access/<DatasetName>.json   -- QA items only, no images
+OmniMedVQA, read directly from a local directory mirror (e.g. a Google
+Drive folder mounted in Colab) -- NOT downloaded from the Hugging Face
+Hub. Point --data-root at a local copy laid out like:
+    {data_root}/QA_information/Open-access/{dataset_name}.json -- QA items
+        whose images are actually available (see below)
+    {data_root}/Images/{dataset_name}/{image_file_name}         -- the
+        images those QA items reference
+    {data_root}/QA_information/Restricted-access/{dataset_name}.json --
+        QA items only, no images (never read by this script)
     Each QA item: {dataset, question_id, question_type, question, gt_answer,
                    image_path, option_A, option_B, option_C, option_D,
                    modality_type}
 
 This script deliberately only ever reads QA_information/Open-access/ --
-Restricted-access QA items reference images not distributed in this repo,
-so they can't be run through the pipeline at all here. Pinning a caller-
-specified, fixed list of open-access dataset names (--dataset-names) also
-keeps this evaluation slice separate and reproducible from whatever gets
-used for future fine-tuning (Section 3.2 of medical_vqa_architecture.md)
--- e.g. reserve some open-access dataset names for eval-only and
-fine-tune on the rest.
+Restricted-access QA items reference images that typically aren't
+distributed, so they can't be run through the pipeline at all here.
+Pinning a caller-specified, fixed list of open-access dataset names
+(--dataset-names) also keeps this evaluation slice separate and
+reproducible from whatever gets used for future fine-tuning (Section 3.2
+of medical_vqa_architecture.md) -- e.g. reserve some open-access dataset
+names for eval-only and fine-tune on the rest.
 
-Two fields in the raw JSON are documented only loosely by the dataset
-README (no example row was independently verified), so this script
-handles both plausible interpretations defensively rather than guessing:
-  - `image_path`: not pinned down as relative-to-repo-root vs.
-    relative-to-the-dataset's-own-Images-subfolder -- see
+Two fields in the raw JSON aren't universally pinned down across
+OmniMedVQA dataset dumps, so this script handles both plausible
+interpretations defensively rather than guessing:
+  - `image_path`: not pinned down as relative-to-data-root vs. relative-
+    to-the-dataset's-own-Images-subfolder vs. a bare filename -- see
     _resolve_image_path().
   - `gt_answer`: not pinned down as the letter (A/B/C/D) vs. the answer
     text (matching one of option_A..D) -- see _resolve_gt_letter().
@@ -35,10 +36,11 @@ A sample whose ground truth can't be resolved under either interpretation
 is skipped and logged (a dataset-annotation issue, not something the
 pipeline can be blindly scored against) -- this is the ONLY reason a
 sample is ever skipped. A sample whose IMAGE fails to load (corrupt file,
-unsupported volumetric format, etc.) is NOT skipped: predict_with_
-diagnostics() (src/predict.py) degrades it to a blind model call on a
-neutral gray canvas instead, so it still gets scored (almost certainly
-wrong, but that's an honest data point, not a silently dropped one).
+unsupported volumetric format, unresolvable path, etc.) is NOT skipped:
+predict_with_diagnostics() (src/predict.py) degrades it to a blind model
+call on a neutral gray canvas instead, so it still gets scored (almost
+certainly wrong, but that's an honest data point, not a silently dropped
+one).
 
 Robustness note: predict_with_diagnostics() runs the same Stage -1
 volumetric/DICOM ingest (src/volume_loader.py) as the competition path
@@ -63,22 +65,23 @@ Usage (run from the repository root):
     python src/evaluate_omnimed.py
     python src/evaluate_omnimed.py --dataset-names ACRIMA "Adam Challenge" --max-samples 50
     python src/evaluate_omnimed.py --list-datasets
-    python src/evaluate_omnimed.py --data-root /path/to/local/OmniMedVQA --max-samples 100
+    python src/evaluate_omnimed.py --data-root /content/drive/MyDrive/OmniMedVQA --max-samples 100
 
 NOTE on dataset names: this script does not hardcode a catalog of
 OmniMedVQA's ~73 source datasets -- only "ACRIMA" (a small, confirmed
 open-access glaucoma-fundus dataset) is used as the default, specifically
 so the default max_samples=20 smoke test is fast and doesn't rely on
-guessed dataset names. Run with --list-datasets to fetch the real,
-current list from the Hub before choosing others.
+guessed dataset names. Run with --list-datasets to see which
+QA_information/Open-access/<name>.json files actually exist under your
+--data-root before choosing others.
 """
 
 import argparse
 import csv
+import json
 import logging
 import random
 import sys
-import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -97,8 +100,7 @@ from src import config  # noqa: E402 - cheap import, no model weights loaded
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-REPO_ID = "foreverbeliever/OmniMedVQA"
-REPO_TYPE = "dataset"
+DEFAULT_DATA_ROOT = "/content/drive/MyDrive/OmniMedVQA"
 DEFAULT_DATASET_NAMES = ["ACRIMA"]
 DEFAULT_MAX_SAMPLES = 20
 DEFAULT_OUTPUT_CSV = "predictions.csv"
@@ -111,66 +113,65 @@ _OPTION_FIELD_BY_LETTER = {letter: f"option_{letter}" for letter in config.CHOIC
 
 
 # ---------------------------------------------------------------------------
-# Data acquisition
+# Data acquisition -- purely local filesystem, no Hugging Face Hub access.
 # ---------------------------------------------------------------------------
-def _ensure_local_data(data_root, dataset_names, cache_dir):
-    """Ensures QA_information/Open-access/<name>.json and Images/<name>/ are
-    present locally for each requested dataset name, downloading only that
-    minimal slice from the Hub via huggingface_hub.snapshot_download if
-    data_root wasn't supplied. Returns the local root Path to read from."""
-    if data_root is not None:
-        root = Path(data_root)
-        if not root.exists():
-            raise FileNotFoundError(f"--data-root {root} does not exist")
-        return root
-
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise ImportError(
-            "huggingface_hub is required to download OmniMedVQA from the Hub "
-            "(see requirements.txt); install it, or pass --data-root to point "
-            "at an already-downloaded local copy instead."
-        ) from exc
-
-    allow_patterns = [f"QA_information/Open-access/{name}.json" for name in dataset_names]
-    allow_patterns += [f"Images/{name}/**" for name in dataset_names]
-
-    logger.info(
-        "Fetching %d dataset(s) from %s (only the requested slice; cached after the first run)...",
-        len(dataset_names), REPO_ID,
-    )
-    local_dir = snapshot_download(
-        repo_id=REPO_ID, repo_type=REPO_TYPE, allow_patterns=allow_patterns, cache_dir=cache_dir,
-    )
-    return Path(local_dir)
+def _require_local_data_root(data_root) -> Path:
+    """Validates --data-root points at an existing local directory. No
+    download/fetch step of any kind -- the caller (e.g. a Colab notebook)
+    is responsible for making the OmniMedVQA mirror available locally
+    first (a mounted Google Drive folder, an already-extracted archive,
+    etc.)."""
+    root = Path(data_root)
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"--data-root {root} does not exist or is not a directory. Point it at a local "
+            "OmniMedVQA mirror containing QA_information/Open-access/<name>.json and "
+            "Images/<name>/<image_file_name> (e.g. a mounted Google Drive folder in Colab)."
+        )
+    return root
 
 
-def list_available_open_access_datasets():
-    """Fetches the real, current list of Open-access QA JSON files from the
-    Hub -- use this instead of guessing dataset names."""
-    from huggingface_hub import list_repo_files
+def list_available_open_access_datasets(data_root):
+    """Lists the Open-access QA JSON files actually present under
+    {data_root}/QA_information/Open-access/ -- use this instead of
+    guessing dataset names."""
+    root = _require_local_data_root(data_root)
+    qa_dir = root / "QA_information" / "Open-access"
+    if not qa_dir.is_dir():
+        raise FileNotFoundError(f"{qa_dir} does not exist under --data-root {root}")
+    return sorted(p.stem for p in qa_dir.glob("*.json"))
 
-    files = list_repo_files(REPO_ID, repo_type=REPO_TYPE)
-    prefix = "QA_information/Open-access/"
-    return sorted(
-        f[len(prefix):-len(".json")] for f in files if f.startswith(prefix) and f.endswith(".json")
-    )
+
+def _load_qa_json(json_path: Path):
+    """Reads one QA_information/Open-access/<name>.json file as a plain
+    list of QA item dicts -- no Hugging Face `datasets` library or Hub
+    access involved. Tolerates both a single JSON array (the common case)
+    and JSON Lines (one JSON object per line), since OmniMedVQA dumps in
+    the wild use either convention."""
+    text = json_path.read_text(encoding="utf-8")
+    stripped = text.lstrip()
+    if stripped.startswith("["):
+        return json.loads(text)
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def _resolve_image_path(root: Path, dataset_name: str, image_path: str):
-    """`image_path`'s exact prefix convention isn't pinned down by the
-    dataset README, so this tries a few plausible resolutions in order and
-    returns the first that actually exists locally, or None. Uses
-    .exists() rather than .is_file() since a volumetric sample may be a
-    directory of slices (see src/volume_loader.py), not a single file."""
+    """Resolves a QA item's image_path to a local file under the fixed
+    local mirror layout: {root}/Images/{dataset_name}/{image_file_name}
+    -- the primary, authoritative resolution, using only the basename of
+    image_path since some dataset dumps store it with a nested prefix
+    (e.g. "<dataset_name>/xyz.png") that doesn't match this flat
+    per-dataset Images/<name>/ directory. Two looser fallbacks are tried
+    after that in case image_path is already root-relative or
+    root/Images-relative, for robustness across dataset dump variations.
+    Uses .exists() rather than .is_file() since a volumetric sample may be
+    a directory of slices (see src/volume_loader.py), not a single file."""
     if not image_path:
         return None
     candidates = [
+        root / "Images" / dataset_name / Path(image_path).name,
         root / image_path,
         root / "Images" / image_path,
-        root / "Images" / dataset_name / image_path,
-        root / "Images" / dataset_name / Path(image_path).name,
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -197,24 +198,24 @@ def _resolve_gt_letter(gt_answer, choices: dict):
     return None
 
 
-def load_eval_samples(data_root, dataset_names, max_samples, seed, cache_dir):
+def load_omnimed_samples(data_root, dataset_names, max_samples, seed):
     """
-    Loads QA items from QA_information/Open-access/<name>.json for each
-    requested dataset name via the Hugging Face `datasets` library,
-    shuffles deterministically (--seed) across the combined pool, and
-    truncates to max_samples (None = no limit). Samples whose image file
-    can't be resolved locally are still kept (predict_with_diagnostics()
-    handles that as a blind-fallback case, not a skip -- see module
-    docstring); only unresolvable ground truth is dropped, in
-    run_evaluation() below.
+    Loads QA items directly from the local OmniMedVQA mirror at
+    --data-root (QA_information/Open-access/<name>.json for each
+    requested dataset name -- see module docstring for the expected
+    layout), read with plain json.load()/_load_qa_json() -- no Hugging
+    Face `datasets` library or Hub access involved. Shuffles
+    deterministically (--seed) across the combined pool, and truncates to
+    max_samples (None = no limit). Samples whose image file can't be
+    resolved locally are still kept (predict_with_diagnostics() handles
+    that as a blind-fallback case, not a skip -- see module docstring);
+    only unresolvable ground truth is dropped, in run_evaluation() below.
 
     Returns a list of dicts: {image_path, question, choices, gt_answer,
     modality_type, dataset, question_id}. `image_path` is None if it
     couldn't be resolved locally.
     """
-    import datasets as hf_datasets
-
-    root = _ensure_local_data(data_root, dataset_names, cache_dir)
+    root = _require_local_data_root(data_root)
 
     json_paths = []
     for name in dataset_names:
@@ -233,8 +234,7 @@ def load_eval_samples(data_root, dataset_names, max_samples, seed, cache_dir):
 
     records = []
     for name, json_path in json_paths:
-        ds = hf_datasets.load_dataset("json", data_files=str(json_path), split="train")
-        records.extend((name, item) for item in ds)
+        records.extend((name, item) for item in _load_qa_json(json_path))
 
     rng = random.Random(seed)
     rng.shuffle(records)
@@ -458,14 +458,14 @@ def _write_diagnostic_csv(results, path):
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="End-to-end accuracy evaluation of src.predict.predict_with_diagnostics() "
-                     "against the Open-access subset of OmniMedVQA (foreverbeliever/OmniMedVQA "
-                     "on the Hugging Face Hub)."
+                     "against a local OmniMedVQA Open-access mirror (no Hugging Face Hub access; "
+                     "see --data-root)."
     )
     parser.add_argument(
         "--dataset-names", nargs="+", default=DEFAULT_DATASET_NAMES,
         help=f"One or more OmniMedVQA Open-access dataset names (e.g. ACRIMA), matching "
-             f"QA_information/Open-access/<name>.json in the repo. Default: {DEFAULT_DATASET_NAMES}. "
-             "Run with --list-datasets to see the real available names.",
+             f"{{data_root}}/QA_information/Open-access/<name>.json. Default: {DEFAULT_DATASET_NAMES}. "
+             "Run with --list-datasets to see the names actually present under --data-root.",
     )
     parser.add_argument(
         "--max-samples", type=int, default=DEFAULT_MAX_SAMPLES,
@@ -473,11 +473,12 @@ def build_arg_parser():
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Shuffle seed for sample selection.")
     parser.add_argument(
-        "--data-root", type=str, default=None,
-        help="Local path to an already-downloaded OmniMedVQA repo copy (containing Images/ "
-             "and QA_information/) -- skips the Hub download entirely.",
+        "--data-root", type=str, default=DEFAULT_DATA_ROOT,
+        help=f"Local path to an OmniMedVQA mirror, containing QA_information/Open-access/ "
+             f"and Images/ (e.g. a Google Drive folder mounted in Colab at "
+             f"/content/drive/MyDrive/...). No download step -- this directory must already "
+             f"exist. Default: {DEFAULT_DATA_ROOT!r}.",
     )
-    parser.add_argument("--cache-dir", type=str, default=None, help="huggingface_hub cache directory override.")
     parser.add_argument(
         "--output-csv", type=str, default=DEFAULT_OUTPUT_CSV,
         help=f"Path to write the standard submission-format CSV (query_id, answer, "
@@ -491,7 +492,8 @@ def build_arg_parser():
     )
     parser.add_argument(
         "--list-datasets", action="store_true",
-        help="List available Open-access dataset names from the Hub and exit (no evaluation, no model load).",
+        help="List Open-access dataset names present under --data-root and exit "
+             "(no evaluation, no model load).",
     )
     return parser
 
@@ -500,14 +502,14 @@ def main():
     args = build_arg_parser().parse_args()
 
     if args.list_datasets:
-        names = list_available_open_access_datasets()
-        print(f"{len(names)} Open-access OmniMedVQA dataset(s) available:")
+        names = list_available_open_access_datasets(args.data_root)
+        print(f"{len(names)} Open-access OmniMedVQA dataset(s) available under {args.data_root}:")
         for name in names:
             print(f"  - {name}")
         return
 
     max_samples = args.max_samples if args.max_samples > 0 else None
-    samples = load_eval_samples(args.data_root, args.dataset_names, max_samples, args.seed, args.cache_dir)
+    samples = load_omnimed_samples(args.data_root, args.dataset_names, max_samples, args.seed)
     if not samples:
         logger.error("No evaluable samples found -- nothing to run.")
         sys.exit(1)
