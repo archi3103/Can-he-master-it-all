@@ -398,7 +398,19 @@ def _volume_to_representative_image(volume: np.ndarray) -> Image.Image:
 # ---------------------------------------------------------------------------
 def _load_nifti(path: Path) -> Image.Image:
     try:
-        img = nib.load(str(path))
+        # mmap=False: nibabel memory-maps uncompressed .nii files by
+        # default (nib.load(path) alone), which is fine on a local disk
+        # but pathological on a network/FUSE-backed filesystem -- e.g. a
+        # Colab Google Drive mount. get_fdata()'s page-fault-driven reads
+        # then turn into many small synchronous round-trips to Drive
+        # instead of one sequential read, and their latency is highly
+        # inconsistent file-to-file depending on Drive's cache/API state
+        # at that moment -- this is what turns "read a 40MB file" into
+        # anywhere from ~0.2s to several minutes for no reason visible
+        # from file size alone. mmap=False forces a plain, fully-buffered
+        # read instead, which FUSE filesystems handle far more
+        # predictably. Immaterial on a local disk either way.
+        img = nib.load(str(path), mmap=False)
         # Reorients to the closest canonical (RAS+) axis ordering, so axis
         # 2 of the returned array is consistently the superior-inferior
         # (axial slice) axis regardless of how the file was acquired/stored.
