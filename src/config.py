@@ -81,6 +81,38 @@ MAX_PIXELS = 1024 * 1024
 # design elsewhere (see the feature-flag section below).
 VOLUME_TRISLICE_DEPTH_FRACTIONS = (0.35, 0.50, 0.65)
 
+# Vote-MI-inspired content-based slice selection (src/volume_loader.py's
+# _select_top_k_slice_indices) -- the primary slice-selection policy;
+# VOLUME_TRISLICE_DEPTH_FRACTIONS above is now only the tier-2 fallback
+# used when content scoring itself errors.
+VOLUME_SLICE_SELECTION_COUNT = 3  # how many representative slices to composite
+# Minimum gap between selected slice indices, as a fraction of total
+# depth -- keeps the selection spread across the volume instead of
+# collapsing onto a cluster of near-duplicate adjacent slices.
+VOLUME_SLICE_MIN_SEPARATION_FRACTION = 0.10
+# Relative weight of edge-density vs. intensity variance in the composite
+# informativeness score -- both are min-max normalized to [0, 1] first,
+# so 1.0 means equal weight by default.
+VOLUME_EDGE_DENSITY_WEIGHT = 1.0
+# Above this many slices, content scoring strides through a coarse sample
+# instead of every slice, to bound worst-case latency on very deep
+# volumes (e.g. a 1000+-slice thin-cut CT series). Sobel + variance is
+# cheap per-slice, but not free at that scale.
+VOLUME_SCORING_MAX_SLICES = 128
+
+# Channel-split microscopy folders (src/volume_loader.py's
+# _tile_color_channels_into_grid): each channel is resized to this fixed
+# (square) size before tiling into the 2x2 grid. Chosen so the finished
+# grid (2 cells + 3 borders per axis) lands comfortably under MAX_PIXELS
+# on its own -- a full-resolution per-channel grid was measured landing
+# right at the MAX_PIXELS cap (Stage 0 then downscaling it to 1024x1024
+# regardless), pushing vision-token count -- and single-query inference
+# time -- well above flat 2D images, right at/over
+# INFERENCE_TIMEOUT_SECONDS even with no other load on the GPU. This
+# trades some per-channel resolution for meaningfully fewer vision
+# tokens.
+VOLUME_CHANNEL_GRID_CELL_SIZE = 448
+
 # ---------------------------------------------------------------------------
 # Stage 2: Modality-specific preprocessing (Section 1.2)
 # ---------------------------------------------------------------------------
