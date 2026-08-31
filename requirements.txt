@@ -21,3 +21,7 @@ huggingface_hub>=0.23.0
 nibabel>=5.2.0
 pydicom>=2.4.0
 # flash-attn>=2.6.0
+# bitsandbytes is only needed if src/config.py's QUANTIZATION_MODE is set
+# to "4bit"/"8bit" (off by default -- see src/model_loader.py). CUDA-only;
+# uncomment and install if you enable quantization.
+# bitsandbytes>=0.43.0

@@ -50,6 +50,23 @@ ATTN_IMPLEMENTATION = "flash_attention_2"
 ATTN_IMPLEMENTATION_FALLBACK = "sdpa"
 
 # ---------------------------------------------------------------------------
+# Optional quantization (src/model_loader.py) -- opt-in only. Default
+# (None) is the native fp16 load path above, completely unchanged: the 4B
+# backbone already fits comfortably (~8-9GB) in fp16 on the target 48GB
+# RTX 6000 Ada (see the backbone-model note above), so this isn't required
+# for the competition deployment -- it exists for constrained-VRAM
+# environments (e.g. a smaller Colab GPU) or experimentation.
+# ---------------------------------------------------------------------------
+QUANTIZATION_MODE = None  # None (fp16, default) | "4bit" | "8bit"
+# Compute dtype bitsandbytes dequantizes into for matmuls, and the
+# torch_dtype used for any non-quantized parameters/buffers (embeddings,
+# layernorms, the vision tower, etc.) when quantization is enabled.
+QUANTIZATION_COMPUTE_DTYPE = torch.bfloat16
+# 4-bit-specific tunables (ignored for "8bit"/None):
+QUANTIZATION_4BIT_QUANT_TYPE = "nf4"
+QUANTIZATION_4BIT_USE_DOUBLE_QUANT = True
+
+# ---------------------------------------------------------------------------
 # LoRA fine-tuning hyperparameters (Section 3.2)
 # ---------------------------------------------------------------------------
 LORA_RANK = 16
