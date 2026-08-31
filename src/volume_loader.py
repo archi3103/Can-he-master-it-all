@@ -94,6 +94,7 @@ predict_by_prefix_score()'s module docstring in src/predict.py).
 import logging
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -513,8 +514,17 @@ def _tile_color_channels_into_grid(channels: dict) -> Image.Image:
     Raises:
         VolumeLoadError if any present channel's file can't be decoded.
     """
+    def _read_one_channel(item):
+        name, path = item
+        return name, Image.open(path).convert("RGB")
+
     try:
-        images = {name: Image.open(p).convert("RGB") for name, p in channels.items()}
+        # Same rationale as _load_dicom_series's parallel reads: on a
+        # network/FUSE-backed filesystem each file open carries real
+        # round-trip latency, so overlapping the (at most 4) reads is
+        # worth it even at this small scale.
+        with ThreadPoolExecutor(max_workers=len(channels)) as pool:
+            images = dict(pool.map(_read_one_channel, channels.items()))
     except Exception as exc:  # noqa: BLE001 - any PIL failure means "corrupt"
         raise VolumeLoadError(f"Cannot decode channel image(s) in {channels}: {exc}") from exc
 
@@ -609,22 +619,43 @@ def _sort_dicom_slices(items: list) -> list:
     return items
 
 
+def _read_one_dicom_slice(path: Path):
+    """Reads and validates a single candidate DICOM slice file. Returns
+    (ds, arr) on success, or None on any failure (non-DICOM file,
+    corrupt, color/multi-frame member) -- never raises, so this can be
+    safely mapped over many files concurrently without one bad file
+    aborting the whole series."""
+    try:
+        ds = pydicom.dcmread(str(path), force=True)
+        arr = ds.pixel_array
+    except Exception:  # noqa: BLE001 - skip non-DICOM/unreadable files in the folder
+        return None
+    if _is_color_dicom(ds) or arr.ndim != 2:
+        return None  # color/multi-frame members mixed into a series folder are unsupported
+    return ds, arr
+
+
 def _load_dicom_series(folder: Path) -> Image.Image:
     try:
         candidate_files = sorted(p for p in folder.rglob("*") if p.is_file())
     except OSError as exc:
         raise VolumeLoadError(f"Cannot list DICOM series folder {folder}: {exc}") from exc
 
-    datasets = []
-    for f in candidate_files:
-        try:
-            ds = pydicom.dcmread(str(f), force=True)
-            arr = ds.pixel_array
-        except Exception:  # noqa: BLE001 - skip non-DICOM/unreadable files in the folder
-            continue
-        if _is_color_dicom(ds) or arr.ndim != 2:
-            continue  # color/multi-frame members mixed into a series folder are unsupported
-        datasets.append((ds, arr))
+    # Reading is I/O-bound (each file is a separate open+read) and
+    # embarrassingly parallel -- on a local disk this barely matters, but
+    # on a network/FUSE-backed filesystem (e.g. a Colab Google Drive
+    # mount) each file open carries real round-trip latency, and a
+    # 275-slice series read one file at a time was measured taking ~20s
+    # there. A thread pool overlaps those round-trips instead of
+    # serializing them; pydicom's file read + numpy pixel-array decode
+    # both release the GIL for their I/O-bound portions, so this
+    # genuinely parallelizes, not just in appearance. ThreadPoolExecutor.
+    # map() preserves input order in its results regardless of which
+    # worker finishes first, so downstream ordering (before
+    # _sort_dicom_slices takes over) is unaffected.
+    with ThreadPoolExecutor(max_workers=config.VOLUME_DICOM_READ_WORKERS) as pool:
+        results = list(pool.map(_read_one_dicom_slice, candidate_files))
+    datasets = [r for r in results if r is not None]
 
     if not datasets:
         raise VolumeLoadError(f"No readable single-frame grayscale DICOM slices found in {folder}")

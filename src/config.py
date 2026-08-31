@@ -113,6 +113,15 @@ VOLUME_SCORING_MAX_SLICES = 128
 # tokens.
 VOLUME_CHANNEL_GRID_CELL_SIZE = 448
 
+# DICOM series folders (src/volume_loader.py's _load_dicom_series): number
+# of files read concurrently via a thread pool. Reading is I/O-bound
+# (pydicom's file read + numpy pixel-array decode release the GIL), and
+# each file open carries real round-trip latency on a network/FUSE-backed
+# filesystem (e.g. a Colab Google Drive mount) -- overlapping reads cuts
+# wall-clock time roughly by this factor there. Harmless on local disk,
+# where I/O is fast enough that this barely matters either way.
+VOLUME_DICOM_READ_WORKERS = 16
+
 # ---------------------------------------------------------------------------
 # Stage 2: Modality-specific preprocessing (Section 1.2)
 # ---------------------------------------------------------------------------
