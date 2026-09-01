@@ -172,14 +172,29 @@ _BRAINMRI_QUESTION = "Which anatomical region is primarily depicted in this MRI 
 
 
 def _prepare_brainmri(raw_root: Path, output_root: Path, eval_fraction: float, seed: int):
-    """Expects the standard Medical Segmentation Decathlon Task01_BrainTumour
-    layout: raw_root/imagesTr/*.nii.gz (4D NIfTI, channel 0 = FLAIR --
+    """Expects EITHER of two layouts, tried in order:
+
+    Layout A -- official Medical Segmentation Decathlon Task01_BrainTumour:
+    raw_root/imagesTr/*.nii.gz, one 4D file per case (channel 0 = FLAIR --
     src/volume_loader.py's _load_nifti() already reduces any 4D NIfTI to
     its first channel automatically, so no preprocessing/splitting of the
-    4 sequences is needed here; every case in this dataset is a brain
-    scan, so the anatomy-ID answer is constant -- a real, correctly-
-    labeled question, just not a within-dataset-diverse one. Excludes
-    imagesTs/ (no ground truth available for the test split)."""
+    4 sequences is needed here). Excludes imagesTs/ (no ground truth
+    available for the test split).
+
+    Layout B -- per-patient BraTS-style mirrors (e.g. several Kaggle
+    "BraTS20" repackagings): one file per MRI sequence per patient,
+    typically PLAIN .nii (not gzipped), nested in an arbitrarily deep
+    per-patient subfolder. Searched recursively; exactly one file is kept
+    per patient folder (prefers the file with "flair" in its name to
+    match Layout A's channel-0 convention, otherwise the first remaining
+    file) so the case-level split stays meaningful -- taking all 4
+    sequences per patient would inflate the case count without adding
+    distinct patients. Segmentation mask files (name contains "seg") are
+    always excluded -- they're a label map, not a scan.
+
+    In both layouts, every case in this dataset is a brain scan, so the
+    anatomy-ID answer is constant -- a real, correctly-labeled question,
+    just not a within-dataset-diverse one."""
     images_dir = raw_root / "imagesTr"
     if not images_dir.is_dir():
         images_dir = raw_root  # tolerate raw_root already pointing at imagesTr/
@@ -187,12 +202,30 @@ def _prepare_brainmri(raw_root: Path, output_root: Path, eval_fraction: float, s
         p for p in images_dir.glob("*.nii.gz")
         if not p.name.startswith(".") and not p.name.startswith("_")  # skip macOS/hidden junk files
     )
+
+    if not cases:
+        by_case_dir = {}
+        for p in raw_root.rglob("*"):
+            if not p.is_file() or p.name.startswith("."):
+                continue
+            name_lower = p.name.lower()
+            if not (name_lower.endswith(".nii") or name_lower.endswith(".nii.gz")):
+                continue
+            if "seg" in name_lower:
+                continue
+            by_case_dir.setdefault(p.parent, []).append(p)
+        for case_dir, files in sorted(by_case_dir.items()):
+            flair = [f for f in files if "flair" in f.name.lower()]
+            cases.append(sorted(flair or files)[0])
+        cases = sorted(cases)
+
     if not cases:
         raise FileNotFoundError(
-            f"No .nii.gz files found under {images_dir} -- check --raw-root points at "
-            "the extracted Task01_BrainTumour folder (or its imagesTr/ subfolder)."
+            f"No .nii/.nii.gz brain MRI files found under {raw_root} -- check --raw-root "
+            "points at the extracted Task01_BrainTumour folder (or its imagesTr/ subfolder), "
+            "or a per-patient BraTS-style mirror."
         )
-    logger.info("Found %d Task01_BrainTumour case(s).", len(cases))
+    logger.info("Found %d BrainMRI case(s).", len(cases))
 
     case_ids = [str(p) for p in cases]
     train_ids, eval_ids = _split_cases(case_ids, eval_fraction, seed)

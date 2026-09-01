@@ -41,8 +41,23 @@ layout):
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
+
+# Must happen before `import torch` -- multi-GPU Kaggle sessions (e.g. "GPU
+# T4 x2") otherwise leave 2 CUDA devices visible, and plain (non-torchrun/
+# non-accelerate-launched) `transformers.Trainer` responds to that by
+# silently wrapping the model in `torch.nn.DataParallel`. DataParallel's
+# naive parameter-replication is incompatible with this script's fixed
+# `device_map` model loading and (when --no-4bit isn't passed) bitsandbytes
+# 4-bit quantized layers -- it manifests as `StopIteration` deep inside
+# Qwen3-VL's `self.visual.dtype` property on the replicated copy, not as
+# anything that looks like a GPU-count problem. A single T4 (16GB) already
+# comfortably fits this 4B QLoRA run (~3GB VRAM at load), so there is no
+# reason to want the second GPU here; respects an explicit override if one
+# is already set in the environment (e.g. a real torchrun/accelerate launch).
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
