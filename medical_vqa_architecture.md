@@ -29,9 +29,23 @@ The architecture below resolves this tension via **implicit routing** (cheap, de
 
 ```
                          ┌─────────────────────────────┐
-                         │   Raw Input: Image + Query   │
+                         │   Raw Input: Image/Path + Query │
                          │   + Choices [A, B, C, D]     │
                          └──────────────┬───────────────┘
+                                        │
+                     ┌──────────────────▼───────────────────┐
+                     │  STAGE -1: Volumetric/DICOM Ingest      │
+                     │  Format dispatch (magic bytes/path):    │
+                     │  .nii/.nii.gz (nibabel, RAS+ canonical),│
+                     │  DICOM single/series (pydicom, HU       │
+                     │  rescale + MONOCHROME1, parallel reads),│
+                     │  RGBY channel-split folders -> 2x2 grid │
+                     │  Vote-MI content-scored slice selection │
+                     │  (variance + edge density) with a       │
+                     │  graded fallback chain; not a volumetric│
+                     │  format -> returns None, PIL handles it │
+                     │  as before (Section 1.5)                │
+                     └──────────────────┬───────────────────┘
                                         │
                      ┌──────────────────▼───────────────────┐
                      │  STAGE 0: Universal Normalization       │
@@ -81,11 +95,14 @@ The architecture below resolves this tension via **implicit routing** (cheap, de
                                         │
                      ┌──────────────────▼───────────────────┐
                      │  STAGE 5: Frozen/Fine-Tuned VLM Core    │
-                     │  Qwen3-VL-4B-Instruct (native, no        │
-                     │    quantization; fits 10GB submission     │
-                     │    size limit)                             │
+                     │  Qwen3-VL-4B-Instruct (native fp16 by     │
+                     │    default, fits 10GB submission size     │
+                     │    limit; opt-in 4-bit/8-bit bitsandbytes │
+                     │    quantization via config.QUANTIZATION_  │
+                     │    MODE for constrained-VRAM deployments) │
                      │  + one general-purpose LoRA adapter      │
-                     │    ("medvqa")                             │
+                     │    ("medvqa"), attached via PeftModel.    │
+                     │    from_pretrained() when present         │
                      └──────────────────┬───────────────────┘
                                         │
                      ┌──────────────────▼───────────────────┐
@@ -140,7 +157,7 @@ A naive "MoE of VLMs" (one full VLM per modality) would require either (a) loadi
 - **One shared VLM backbone** stays resident in VRAM at all times (pre-loaded globally).
 - **Modality/intent-specific behavior is injected via prompting and lightweight LoRA adapter switching**, not full model swapping. LoRA adapters (a few hundred MB each) can be hot-swapped in <50ms via PEFT's `set_adapter()`, which is far cheaper than reloading a full checkpoint.
 
-**As implemented today, exactly one general-purpose adapter is loaded and active, and it's optional:** `config.LORA_ADAPTER_NAME = "medvqa"`, loaded in `src/model_loader.py` via `model.load_adapter(...)` + `model.set_adapter(...)` **only if `config.LORA_PATH` exists and is non-empty**. Since no fine-tuning script exists in this repository (Section 3.2), that directory won't exist for most setups; rather than hard-fail the whole import, the loader logs a warning and continues on the base model unmodified — and the same fallback applies if a directory is present but the adapter fails to load (e.g. one trained against a different model size, Section 3.1's migration notes). The multi-adapter hot-swap capability described above is architecturally supported (PEFT's `set_adapter()` is the mechanism, and it's already in the code) but not yet exercised — no second (e.g. microscopy-specialized) adapter ships or is switched at runtime.
+**As implemented today, exactly one general-purpose adapter is loaded and active, and it's optional:** `config.LORA_ADAPTER_NAME = "medvqa"`, attached in `src/model_loader.py` via `peft.PeftModel.from_pretrained(model, config.LORA_PATH, adapter_name=...)` **only if `config.LORA_PATH` exists and is non-empty**. This wraps `model` in a `PeftModel` rather than mutating it in place — `model` is only reassigned to that wrapper on success (Python never reaches the assignment if the call raises), so a failed load leaves the original base model bound and untouched, no partial/half-wrapped state possible. `src/train_lora.py` (Section 3.2) is the script that produces an adapter at that path; until it's been run, that directory won't exist for most setups, and rather than hard-fail the whole import, the loader logs a warning and continues on the base model unmodified — the same fallback applies if a directory is present but the adapter fails to load (e.g. one trained against a different model size, Section 3.1's migration notes). `PeftModel` preserves the same `model(**inputs)` / `.generate()` / `.device` / `.eval()` surface every downstream call site (`decode.py`, `prefix_score.py`, the warm-up pass) relies on, so nothing downstream needed to change for this. The multi-adapter hot-swap capability described above is architecturally supported (`PeftModel.set_adapter()` is the mechanism, and it's already called once per load) but not yet exercised for *switching* — no second (e.g. microscopy-specialized) adapter ships or is switched at runtime.
 
 ### 1.4 Hierarchical Subtype Routing (12-Modality Scaling)
 
@@ -171,6 +188,45 @@ Every classifier is a cheap, zero-VRAM, **unvalidated heuristic starting point**
 1. **Coarse-router misrouting risk for near-grayscale macroscopic subtypes.** `detect_modality()` leans heavily on saturation/grayscale-deviation to separate "radiology" from "macroscopic." Both IRI (near-grayscale, single-wavelength infrared reflectance imaging) and OCT (near-grayscale cross-sectional B-scan) are low-saturation modalities that risk being misrouted into "radiology" before any subtype classifier ever runs — a pre-existing constraint of the coarse router (deliberately left unmodified), accepted as bounded risk pending validation.
 2. **Cytology is folded into `histopathology`, not a separate subtype.** Preprocessing treatment (Macenko normalization + tissue-fraction tile selection) is effectively identical for both; a future split has cheap groundwork already in `_select_informative_tile()`'s tissue-fraction metric (cytology's sparse cell-cluster pattern should show a measurably lower tissue fraction than dense histopathology).
 3. **Subtype is not threaded into prompt composition.** `build_system_prompt()` (Section 2.3) is keyed only by `config.MODALITIES` (the 4 coarse streams); an OCT B-scan and an ultrasound image currently receive the *same* "This is an ultrasound image..." modality-context sentence. Extending `MODALITY_PROMPTS` to be subtype-aware is a natural next step, not yet done.
+
+### 1.5 Stage -1: Volumetric/DICOM Ingest
+
+PIL cannot decode 3D NIfTI volumes, raw DICOM files, or folders of DICOM slices at all. Originally, any such input hit `predict()`'s corrupt-image guard (PIL raising `UnidentifiedImageError`/`OSError`) and silently fell back to `config.FALLBACK_ANSWER_LETTER`, with no real image analysis. `src/volume_loader.py` implements a dedicated ingest stage, **Stage -1**, that runs before PIL ever touches the path — before Stage 0 — and decodes these formats into a single 2D RGB PIL Image that flows into the existing Stage 0-6 pipeline exactly like any flat 2D image. It is invoked from `predict.py`'s `_load_input_image()` helper, shared by every entry point (`predict()`, `predict_with_diagnostics()`, `predict_by_prefix_score()` — Section 5.2).
+
+**Format dispatch (`load_volume(path)`):**
+
+| Input | Handling |
+|---|---|
+| Flat 2D image (`.png`/`.jpg`/`.bmp`/`.tif`/etc.) | Returns `None` immediately — zero extra I/O cost; caller opens it with PIL as before |
+| `.nii` / `.nii.gz` | `nibabel.load(path, mmap=False)`, reoriented via `nib.as_closest_canonical()` so axis 2 of the returned array is consistently the superior-inferior (axial) axis regardless of acquisition orientation |
+| `.dcm` / `.dicom`, or a file with unrecognized extension whose first 128+4 bytes match the DICOM Part 10 magic (`DICM`) | `pydicom.dcmread(path, force=True)`, single file (including multi-frame single-file DICOM, treated as its own volume) |
+| A directory containing `<id>_red.png` / `_green.png` / `_blue.png` / `_yellow.png`-style filenames (any 1-4 of the four) | **Not** treated as a DICOM series at all — these are parallel spectral/fluorescence *views of the same imaging plane* (e.g. Human Protein Atlas exports), not spatial depth slices. Composited via `_tile_color_channels_into_grid()` (below) |
+| Any other directory | `pydicom.dcmread()` on every contained file (recursively), keeping only single-frame grayscale slices, geometrically sorted, treated as a DICOM series |
+
+`mmap=False` is not a minor detail: nibabel memory-maps uncompressed `.nii` files by default, which is fine on local disk but pathological on a network/FUSE-backed filesystem (a Colab Google Drive mount, in particular) — `get_fdata()`'s page-fault-driven reads turn into many small synchronous round-trips instead of one sequential read, and were observed taking up to several minutes for a ~40MB file with no correlation to file size. `mmap=False` forces a plain, fully-buffered read instead.
+
+**Pixel-value correctness (the "raw DICOM data" true-HU-windowing gap noted in Section 1.2's preprocessing table is closed here, not there):**
+- `RescaleSlope`/`RescaleIntercept` are applied before any windowing, so pixel values become real Hounsfield units (or the modality's native scale) rather than raw stored integers.
+- `MONOCHROME1` (DICOM's inverted-grayscale convention, 0 = white) is flipped to the `MONOCHROME2` convention (0 = black) that every downstream heuristic in `router_modality.py`/`preprocessing.py` assumes.
+- Color DICOM (e.g. color Doppler) is detected (`SamplesPerPixel >= 3` or a `RGB`/`YBR` `PhotometricInterpretation`) and passed through as-is (no YBR colorspace conversion — rare enough in this pipeline's target modalities not to warrant it, and this only affects color fidelity, never crashes).
+
+**Vote-MI-inspired representative-slice selection.** Rather than a single arbitrary slice (risks landing on an uninformative edge slice) or a fixed relative depth, every candidate slice (strided above `config.VOLUME_SCORING_MAX_SLICES` = 128 to bound worst-case latency on very deep series) is scored by two unsupervised signals computed on a shared, volume-wide percentile-stretched 0-255 scale:
+- **Intensity variance** — a mostly-uniform air/background slice scores near zero.
+- **Edge density** — mean Sobel gradient magnitude, a proxy for visible anatomical structure/boundaries.
+
+Both signals are min-max normalized across the candidate pool and summed (`config.VOLUME_EDGE_DENSITY_WEIGHT`, default equal weight) into one composite score per slice. The top `config.VOLUME_SLICE_SELECTION_COUNT` (default 3) slices are picked greedily by that score, subject to a minimum index separation (`config.VOLUME_SLICE_MIN_SEPARATION_FRACTION` × depth, default 10%) so the selection can't collapse onto a cluster of near-duplicate adjacent slices — representative coverage of the volume, not just its single busiest region. Verified against real dev-data volumes: a 275-slice CT series correctly picked three genuinely distinct, anatomically rich cross-sections (neck, upper chest, lung) versus the fixed-percentage policy's three arbitrary, less-informative picks; a brain MRI's picks spanned skull base → orbits → cortex with visible gyri. This is a heuristic voting signal inspired by representative-slice-selection principles in multi-instance medical volume analysis, not a literal reproduction of any specific published algorithm — unvalidated against labeled data, same caveat as Section 1.4's subtype classifiers.
+
+The selected slices are tiled horizontally into one composite via `_tile_slices()`, windowed against one shared percentile range so the tiles stay visually consistent with each other.
+
+**Graded, zero-crash fallback chain**, entirely inside `volume_loader.py`, layered *underneath* the outer blind-gray-canvas fallback described in Section 5.2/5.5:
+1. Content-based (Vote-MI) multi-slice selection + tiling (primary path).
+2. If content scoring itself errors: fall back to the original fixed-percentage (35%/50%/65% depth) slice-index heuristic, still tiled via the same function.
+3. If tiling/compositing fails at either of the above: fall back further to a single slice (the same policy's middle pick) with a plain percentile stretch, no tiling.
+4. Only if that also fails does a `VolumeLoadError` propagate out of this module — the outer layer (`predict.py`) then substitutes a neutral gray canvas and still attempts a real (blind) model call, rather than a hardcoded fallback letter (Section 5.2).
+
+**Multi-channel grid compositing (`_tile_color_channels_into_grid()`).** Channel-split microscopy/fluorescence folders are arranged into a fixed 2×2 grid — blue top-left, green top-right, red bottom-left, yellow bottom-right, with a thin border between quadrants — so the VLM inspects every available channel at full (capped) resolution, unmixed, in one forward pass, rather than a blended pseudo-color guess at which channel contributed what. Each channel is resized to `config.VOLUME_CHANNEL_GRID_CELL_SIZE` (448px square) before tiling — both to normalize any size mismatch across channels and to keep the finished grid comfortably under the processor's `MAX_PIXELS` cap on its own; an earlier full-native-resolution version of this grid was measured landing right at that cap, pushing single-query vision-token count and inference latency to right at/over `config.INFERENCE_TIMEOUT_SECONDS` even with no other system load. Missing channels (a sample with only 2-3 of the 4) get a flat placeholder quadrant rather than a reflowed grid, so "top-right is always green" stays a stable convention regardless of which channels a given sample ships.
+
+**I/O parallelism.** Both the DICOM-series file reads and the (at most 4) channel-grid file reads happen concurrently via `ThreadPoolExecutor` (`config.VOLUME_DICOM_READ_WORKERS`, default 16 workers for the series case) rather than one file at a time — pydicom's read and PIL's decode both release the GIL for their I/O-bound portions, so this genuinely overlaps. Immaterial on local disk; meaningful on a network/FUSE-backed filesystem where each file open carries real round-trip latency (a 275-slice series read sequentially was measured at ~20s on a Colab Google Drive mount).
 
 ---
 
@@ -314,13 +370,33 @@ Adapter variants:   Optionally train 2-3 separate LoRA adapters:
                      Hot-swap via PEFT set_adapter() based on router output
 ```
 
-**As implemented**, `src/config.py` holds these exact hyperparameters as named constants (`LORA_RANK = 16`, `LORA_ALPHA = 32`, `LORA_DROPOUT = 0.05`, `LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]`, `LORA_EPOCHS = 3`), ready for a fine-tuning script to consume — but **no fine-tuning/training script exists in this repository**. Section 3 remains an offline, pre-competition strategy; the runtime `predict()` path (Section 5) only ever *loads* an already-trained adapter (Section 3.1's single "medvqa" adapter, Section 1.3), it never trains one.
+**As implemented**, `src/config.py` holds these exact hyperparameters as named constants (`LORA_RANK = 16`, `LORA_ALPHA = 32`, `LORA_DROPOUT = 0.05`, `LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]`, `LORA_EPOCHS = 3`), and **`src/train_lora.py` now consumes them** — a complete, working LoRA fine-tuning script, run offline/pre-competition, entirely separate from the runtime `predict()` path (Section 5), which only ever *loads* an already-trained adapter (Section 3.1, Section 1.3).
+
+**As implemented (`src/train_lora.py`), differing from the blueprint above in a few deliberate ways:**
+
+- **Data loading is shared with the evaluation tooling**, not a separate loader: `train_lora.py` calls `src.evaluate_omnimed.load_omnimed_samples()` / `_resolve_gt_letter()` directly, so the same local OmniMedVQA mirror (`--data-root`, Section 5.6) serves both fine-tuning and evaluation with byte-identical sample resolution. Only OmniMedVQA is wired up this way today — PMC-VQA/VQA-RAD/SLAKE/PathVQA remain unimplemented, offline-strategy-only, as in the original blueprint.
+- **Training examples are built from the exact same Stage 0-4 pipeline `predict()` uses at inference** (`universal_normalize`, `route_modality`, `preprocess_image`, `detect_track`, `build_system_prompt`, then the same chat template + `"{query}\n\n{choices_str}\n\nAnswer with only the letter."` user-prompt format from Section 5.2) — not a hand-approximated variant that could drift from eval-time formatting. This directly satisfies the "match the fine-tuning answer format exactly to the eval format" requirement below by construction, rather than by manual discipline.
+- **Loss is masked to only the answer-letter token**, exactly as specified below, computed by tokenizing the prompt alone and the prompt-plus-letter together (independently, not by splicing token tensors — Qwen3-VL's M-RoPE position-id computation needs an internally-derived image/text token-type map that only stays consistent when the processor builds the whole sequence itself; a discovered-and-fixed pitfall, see Section 5.6's `prefix_score.py` note) and masking every position before where the letter starts.
+- **QLoRA (4-bit bitsandbytes) is the default, not full-precision LoRA on a 48GB card**, specifically because this script is written to also run on a free-tier Kaggle GPU (T4/P100, 16GB) — see Section 3.3. `--no-4bit` opts back into the original "single RTX 6000 Ada, fp16 + LoRA, no quantization needed" path.
+- **Per-device batch size is fixed at 1**, with `--grad-accum-steps` (default 8) for a larger effective batch size, rather than a padded/collated multi-example batch — multi-image batching for a VLM needs `pixel_values`/`image_grid_thw` padded consistently across differently-sized images, which adds real complexity for no benefit at the data volumes LoRA fine-tuning actually uses.
+- **Model loading is independent of `src/model_loader.py`**, deliberately: that module is inference-oriented (`eval()` mode, a CUDA warm-up `generate()` call, and — critically — it would auto-attach whatever adapter already exists at `config.LORA_PATH`, wrongly double-wrapping a fresh training run with a stale adapter's weights already active underneath the new `LoraConfig`). `train_lora.py` has its own from-scratch model load, sharing only `config.py`'s constants as the source of truth.
+- **The adapter variants described in the blueprint (general-purpose + microscopy-specialized) remain unimplemented** — `train_lora.py` produces exactly one adapter per run, matching Section 1.3's "not yet exercised" note on adapter hot-swapping.
+
+Verified end-to-end on real hardware (not just code-reviewed): a real training run against a synthetic local OmniMedVQA mirror completed successfully in 4-bit on a 6GB GPU; all 144 `lora_B` weight matrices were confirmed to have moved off their zero-initialization (proof gradients genuinely flowed, not just that the script exited 0); and the resulting adapter was loaded back through the real `src/model_loader.py` `PeftModel.from_pretrained()` path and used in a live `predict()` call successfully — full round-trip.
 
 **Critical: match the fine-tuning answer format exactly to the eval format.** If training examples present choices as "A) ... B) ... C) ... D) ..." and expect a bare letter as the target, the eval-time prompt must be byte-identical in structure. Format mismatch between fine-tuning and inference is the single most common cause of degraded constrained-decoding accuracy. `src/predict.py`'s actual prompt construction (`f"{query}\n\n{choices_str}\n\nAnswer with only the letter."` with `choices_str` built as `"A) ...\nB) ...\n"`) is the eval-time format this must match.
 
 ### 3.3 Quantization & Trade-offs
 
-**Current decision: no quantization.** `src/model_loader.py` loads Qwen3-VL-4B-Instruct natively (fp16), with no `quantization_config` at all. This section originally recommended AWQ 4-bit quantization for Qwen2-VL-7B; that recommendation and the trade-off table behind it are kept below for the historical comparison, followed by why the project moved off it.
+**Current decision: no quantization by default, but opt-in bitsandbytes 4-bit/8-bit support now exists.** `src/model_loader.py` loads Qwen3-VL-4B-Instruct natively (fp16) unless `config.QUANTIZATION_MODE` (`None` | `"4bit"` | `"8bit"`, default `None`) is explicitly set — with the default, loading behavior is byte-identical to before this option existed. This isn't a reversal of the "no quantization" decision for the competition deployment (the 4B backbone still comfortably fits in fp16 on the target 48GB RTX 6000 Ada, Section 3.1); it exists for constrained-VRAM environments, most concretely `src/train_lora.py`'s default QLoRA fine-tuning path on a free-tier Kaggle GPU (Section 3.2), where fp16 gradients/activations/optimizer state genuinely don't fit even though inference-only fp16 weights would.
+
+**Implementation notes, since this is a real, tested code path, not just a design intent:**
+- `_build_quantization_config()` (`model_loader.py`) constructs a `transformers.BitsAndBytesConfig` — `load_in_4bit=True` with `bnb_4bit_compute_dtype`/`bnb_4bit_quant_type` (`"nf4"`)/`bnb_4bit_use_double_quant` from `config.py`, or plain `load_in_8bit=True`.
+- It is built once, at module scope, **before** the flash-attn → sdpa retry `try/except` (Section 4.1) — not folded into it. `transformers.BitsAndBytesConfig` constructs fine even without the `bitsandbytes` package actually installed (the real dependency is only pulled in later, inside `from_pretrained()`'s quantizer dispatch); an explicit `import bitsandbytes` presence check surfaces a missing install as its own clear, immediate `ImportError`, rather than letting it surface deeper inside the model load and get misattributed to "flash-attn unavailable" by the attention-fallback retry logic.
+- `device_map` stays a single fixed device string (`config.DEVICE`, e.g. `"cuda:0"`) under quantization too, not switched to `device_map="auto"` — `"auto"` enables accelerate's multi-GPU/CPU-offload sharding, not wanted for this single-GPU deployment and not required for bitsandbytes to work.
+- Tested (with `bitsandbytes` installed, both mocked-construction and a real end-to-end 4-bit training run, Section 3.2): `_build_quantization_config()`'s three branches (`None`, `"4bit"`, `"8bit"`), its invalid-mode `ValueError`, and its missing-dependency `ImportError` all behave correctly and independently — including a real ordering bug caught during testing, where an invalid mode string was originally being masked by the bitsandbytes-presence check before mode validation ever ran.
+
+This section originally recommended AWQ 4-bit quantization for Qwen2-VL-7B; that recommendation and the trade-off table behind it are kept below for the historical comparison, followed by why the project moved off it.
 
 | Config | VRAM | Relative Latency | Accuracy Impact |
 |---|---|---|---|
@@ -352,11 +428,33 @@ processor = AutoProcessor.from_pretrained(
     config.MODEL_PATH, min_pixels=config.MIN_PIXELS, max_pixels=config.MAX_PIXELS,
 )
 
+def _build_quantization_config():
+    """None unless config.QUANTIZATION_MODE is explicitly set (Section 3.3)
+    -- built once, before the attn-implementation retry below, so a
+    misconfigured/missing bitsandbytes install fails loudly and
+    immediately rather than being conflated with a flash-attn failure."""
+    if config.QUANTIZATION_MODE is None:
+        return None
+    import bitsandbytes  # presence check; raises its own clear ImportError
+    from transformers import BitsAndBytesConfig
+    if config.QUANTIZATION_MODE == "4bit":
+        return BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=config.QUANTIZATION_COMPUTE_DTYPE,
+            bnb_4bit_quant_type=config.QUANTIZATION_4BIT_QUANT_TYPE,
+            bnb_4bit_use_double_quant=config.QUANTIZATION_4BIT_USE_DOUBLE_QUANT,
+        )
+    return BitsAndBytesConfig(load_in_8bit=True)  # "8bit"
+
+_quantization_config = _build_quantization_config()
+
 def _load_model(attn_implementation):
-    return Qwen3VLForConditionalGeneration.from_pretrained(
-        config.MODEL_PATH, torch_dtype=config.TORCH_DTYPE, device_map=config.DEVICE,
-        attn_implementation=attn_implementation,
-    )
+    kwargs = dict(device_map=config.DEVICE, attn_implementation=attn_implementation)
+    if _quantization_config is not None:
+        kwargs["quantization_config"] = _quantization_config
+        kwargs["torch_dtype"] = config.QUANTIZATION_COMPUTE_DTYPE
+    else:
+        kwargs["torch_dtype"] = config.TORCH_DTYPE
+    return Qwen3VLForConditionalGeneration.from_pretrained(config.MODEL_PATH, **kwargs)
 
 try:
     model = _load_model(config.ATTN_IMPLEMENTATION)           # "flash_attention_2"
@@ -364,10 +462,13 @@ except (ImportError, ValueError):
     model = _load_model(config.ATTN_IMPLEMENTATION_FALLBACK)  # "sdpa"
 
 # LoRA is optional: only attempted if config.LORA_PATH exists and is
-# non-empty, and degrades to the base model (logged) if loading fails.
+# non-empty, and degrades to the base model (logged) if loading fails --
+# `model` is only reassigned on success, so a failed attach leaves the
+# original base model bound and untouched (Section 1.3).
 if Path(config.LORA_PATH).is_dir() and any(Path(config.LORA_PATH).iterdir()):
     try:
-        model.load_adapter(config.LORA_PATH, adapter_name=config.LORA_ADAPTER_NAME)
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, config.LORA_PATH, adapter_name=config.LORA_ADAPTER_NAME)
         model.set_adapter(config.LORA_ADAPTER_NAME)
     except Exception:
         pass  # logged, falls back to the base model -- see src/model_loader.py
@@ -380,7 +481,9 @@ with torch.inference_mode():
     torch.cuda.synchronize()
 ```
 
-**Model class history, briefly:** this loader has gone through `AutoModelForVision2Seq` → `Qwen2VLForConditionalGeneration` (some installed `transformers` builds didn't export the generic Auto class) → the current `Qwen3VLForConditionalGeneration`, following the Section 3.3 migration off AWQ-quantized Qwen2-VL entirely. No `quantization_config` is passed at all now — see Section 3.3. `Qwen3VLForConditionalGeneration` is size-agnostic — the same class loads the 2B/4B/8B Instruct variants alike, so the later 8B → 4B resize (Section 3.1) changed only `config.MODEL_PATH`/`config.BASE_MODEL_NAME`, with zero code changes here.
+**Model class history, briefly:** this loader has gone through `AutoModelForVision2Seq` → `Qwen2VLForConditionalGeneration` (some installed `transformers` builds didn't export the generic Auto class) → the current `Qwen3VLForConditionalGeneration`, following the Section 3.3 migration off AWQ-quantized Qwen2-VL entirely. No `quantization_config` is passed by default — see Section 3.3 for the opt-in bitsandbytes path this loader now also supports. `Qwen3VLForConditionalGeneration` is size-agnostic — the same class loads the 2B/4B/8B Instruct variants alike, so the later 8B → 4B resize (Section 3.1) changed only `config.MODEL_PATH`/`config.BASE_MODEL_NAME`, with zero code changes here.
+
+**`model` may be a `Qwen3VLForConditionalGeneration` or a `peft.PeftModel` wrapping one**, depending on whether a LoRA adapter attached successfully (Section 1.3). Every downstream call site (`decode.py`, `prefix_score.py`, the warm-up pass above) only ever uses the common surface both object types provide identically (`model(**inputs)`, `.generate()`, `.device`, `.eval()`), so nothing downstream branches on which one it actually got.
 
 **Current default is the `sdpa` fallback path, not Flash-Attention 2:** `requirements.txt` (Section 5.4) currently ships with `flash-attn` commented out, so unless it's installed separately, `_load_model(config.ATTN_IMPLEMENTATION)` raises and every deployment falls through to `attn_implementation="sdpa"`. This is a correct, functioning code path (see Section 4.4), just worth knowing it's the realistic default right now rather than a rare edge case.
 
@@ -415,7 +518,7 @@ def constrained_predict_letter(inputs):
     return max(scores, key=scores.get)
 ```
 
-**As implemented** (`src/decode.py`), this matches almost verbatim: the per-letter variant list `[letter, f" {letter}", f"{letter})", f"({letter}"]` is sourced from `config.CHOICE_TOKEN_VARIANTS` rather than inlined, and `model`/`processor` are imported from `src.model_loader` rather than assumed as bare globals. Functionally identical.
+**As implemented** (`src/decode.py`), this matches almost verbatim: the per-letter variant list `[letter, f" {letter}", f"{letter})", f"({letter}"]` is sourced from `config.CHOICE_TOKEN_VARIANTS` rather than inlined, and `model`/`processor` are imported from `src.model_loader` rather than assumed as bare globals. Functionally identical, with one addition: the actual function is `constrained_predict_with_scores(inputs, valid_letters=None) -> (letter, scores)`, returning the full `{letter: logit}` dict alongside the winning letter — `constrained_predict_letter()` is now a thin wrapper (`letter, _ = constrained_predict_with_scores(...)`) kept for the competition path's call sites. The scores dict exists so callers that need more than the winning letter (`predict_with_diagnostics()`'s `top1_logit`/`top2_logit`/`logit_margin` diagnostic fields, Section 5.2) don't need a second forward pass. `valid_letters` (defaulting to all of `CHOICE_TOKEN_IDS`) restricts the argmax to exactly the letters a given query actually offers, so a 2-choice/Yes-No row can never be answered "C" or "D" just because those tokens happened to score higher on unrelated logits.
 
 This approach:
 - **Eliminates generation loops entirely** — one forward pass, not autoregressive decoding, since we only need the argmax over the candidate first-token logits (up to 4 surface-variant token ids per letter, then the best of those per letter, then the best letter overall).
@@ -443,7 +546,7 @@ This bounds the number of vision tokens fed into the LLM, directly bounding both
 
 ### 4.4 Additional Latency Levers
 
-- **`torch.inference_mode()`** everywhere (no autograd graph tracking) — used in `decode.py`'s `constrained_predict_letter()` and the warm-up pass in `model_loader.py`.
+- **`torch.inference_mode()`** everywhere (no autograd graph tracking) — used in `decode.py`'s `constrained_predict_with_scores()` (Section 4.2) and the warm-up pass in `model_loader.py`.
 - **Flash-Attention 2** backend for the vision and language attention blocks when available, with a runtime fallback to `sdpa` (`src/model_loader.py`'s `_load_model()` try/except) if the wheel isn't installed or fails to import. **As currently configured, `requirements.txt` ships `flash-attn` commented out, so `sdpa` is the practical default** (Section 4.1/5.4) — re-enable that line and reinstall once a compatible wheel/CUDA toolkit is confirmed available to get the Flash-Attention 2 speedup.
 - **Batching (if evaluation allows batched calls):** Not applicable if `predict()` is called one query at a time per spec; not implemented.
 - **Skip the CPU-based sentence-embedding fallback classifier when the regex router already matches** — implemented exactly as described: `router_intent.py`'s `detect_track()` only calls the embedding-based `_detect_track_embedding()` when the regex pass (`_detect_track_regex()`) returns no match.
@@ -461,13 +564,25 @@ This bounds the number of vision tokens fed into the LLM, directly bounding both
 ```
 <repo root>/
 ├── requirements.txt
-├── run_predictions.py           # entrypoint: loops dataset, calls predict(), writes CSV
+├── eval.py                       # THE competition entrypoint (fixed invocation
+│                                  #   contract: `python eval.py input_dir <path>`,
+│                                  #   parses dev_metadata.csv -- Section 5.3)
+├── run_predictions.py            # generic scaffold entrypoint: loops a harness-
+│                                  #   provided data_loader.py, calls predict(), writes CSV
+├── kaggle_finetune_lora.ipynb    # copy-paste-ready Kaggle notebook driving
+│                                  #   src/train_lora.py end-to-end (Section 5.7)
 ├── medical_vqa_architecture.md
+├── datasets.md                   # which dataset is used for evaluation vs.
+│                                  #   fine-tuning, per PS-named modality (Section 5.7)
+├── MedVQA_Pipeline_Technical_Audit.md  # external review + status/TODO tracking
 ├── src/
 │   ├── __init__.py
 │   ├── config.py                 # paths, constants, MIN/MAX_PIXELS, subtype taxonomy
-│   │                              #   (Section 1.4), feature flags, k-aware thresholds
-│   ├── model_loader.py           # global model/processor/adapter loading (import-time)
+│   │                              #   (Section 1.4), volumetric ingest / quantization /
+│   │                              #   blind-fallback tunables, feature flags
+│   ├── model_loader.py           # global model/processor/adapter loading (import-time),
+│   │                              #   opt-in quantization (Section 3.3)
+│   ├── volume_loader.py          # Stage -1: volumetric/DICOM ingest (Section 1.5)
 │   ├── router_modality.py        # Stage 1: hierarchical modality routing (coarse
 │   │                              #   4-bucket router, unchanged + Section 1.4 subtypes)
 │   ├── router_intent.py          # Stage 3: query-intent / track classification
@@ -475,13 +590,24 @@ This bounds the number of vision tokens fed into the LLM, directly bounding both
 │   │                              #   subtype-specific image preprocessing
 │   ├── prompt_builder.py         # Stage 4: system prompt composition
 │   ├── decode.py                  # Stage 6: logit-masked constrained decoding
-│   └── predict.py                 # top-level predict(image, query, choices) function
+│   ├── prefix_score.py            # OmniMedVQA-paper-comparable scoring (Section 5.6)
+│   ├── predict.py                 # predict() (competition path), plus
+│   │                              #   predict_with_diagnostics() /
+│   │                              #   predict_by_prefix_score() (Section 5.2)
+│   ├── evaluate_omnimed.py        # local-mirror OmniMedVQA evaluation harness,
+│   │                              #   metrics/bootstrap-CI/diagnostic sidecar (Section 5.6)
+│   ├── train_lora.py              # LoRA fine-tuning script (Section 3.2)
+│   └── prepare_external_dataset.py  # converts external volumetric/2D datasets
+│                                  #   (MosMedData, Task01_BrainTumour, BUSI) into the
+│                                  #   OmniMedVQA local-mirror shape (Section 5.7, datasets.md)
 └── weights/                      # NOT present in this repo -- expected at deployment
     ├── qwen3-vl-4b-instruct/      # unquantized base weights (local, no internet)
-    ├── lora-medvqa/               # fine-tuned LoRA adapter -- NOTE: must be retrained
-    │                              #   against Qwen3-VL-4B specifically; an adapter
-    │                              #   trained against Qwen2-VL-7B OR Qwen3-VL-8B is
-    │                              #   NOT architecture-compatible (different hidden
+    ├── lora-medvqa/               # fine-tuned LoRA adapter -- produced by
+    │                              #   src/train_lora.py (Section 3.2), or trained
+    │                              #   elsewhere; NOTE: must be trained against
+    │                              #   Qwen3-VL-4B specifically -- an adapter trained
+    │                              #   against Qwen2-VL-7B OR Qwen3-VL-8B is NOT
+    │                              #   architecture-compatible (different hidden
     │                              #   sizes/attention config per model size)
     ├── modality-router/            # optional, only used if USE_LEARNED_ROUTER is enabled
     └── stain_reference_matrix.npy  # optional; falls back to the standard Macenko
@@ -494,16 +620,18 @@ This bounds the number of vision tokens fed into the LLM, directly bounding both
 
 ```python
 # src/predict.py
-import logging, threading
+import logging, threading, time
+from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 
 from src import config
 from src.model_loader import model, processor         # import triggers global load (Section 4.1)
+from src.volume_loader import load_volume, VolumeLoadError  # Stage -1 (Section 1.5)
 from src.router_modality import route_modality          # Stage 1 (Section 1.2 / 1.4)
 from src.router_intent import detect_track                # Stage 3 (Section 2.1)
 from src.preprocessing import preprocess_image, universal_normalize  # Stage 0 + 2
 from src.prompt_builder import build_system_prompt          # Stage 4 (Section 2.3)
-from src.decode import constrained_predict_letter             # Stage 6 (Section 4.2)
+from src.decode import constrained_predict_with_scores        # Stage 6 (Section 4.2)
 
 logger = logging.getLogger(__name__)
 
@@ -523,17 +651,27 @@ def _run_with_timeout(fn, timeout_seconds):
     return None if thread.is_alive() else result.get("value")
 
 
+def _load_input_image(image) -> Image.Image:
+    """Stage -1 + corrupt-image guard, shared by all three entry points below."""
+    if isinstance(image, (str, Path)):
+        volume_image = load_volume(Path(image))  # Section 1.5 -- None if not volumetric
+        if volume_image is not None:
+            image = volume_image
+    if not isinstance(image, Image.Image):
+        image = Image.open(image)
+    image.load()
+    return image
+
+
 def predict(image, query: str, choices: dict) -> str:
-    # --- Corrupt/unreadable image guard (Section 5.5) ---
+    # --- Stage -1 + corrupt/unreadable image guard (Section 5.5) ---
     try:
-        if not isinstance(image, Image.Image):
-            image = Image.open(image)
-        image.load()
-    except (UnidentifiedImageError, OSError, ValueError):
+        image = _load_input_image(image)
+    except (VolumeLoadError, UnidentifiedImageError, OSError, ValueError):
         return config.FALLBACK_ANSWER_LETTER
 
-    # --- Malformed-choices guard: exactly {"A","B","C","D"} keys (Section 5.5) ---
-    if not (isinstance(choices, dict) and set(choices) == set(config.CHOICE_LETTERS)):
+    # --- Malformed-choices guard: {"A","B"} or {"A","B","C","D"} (Section 5.5) ---
+    if not (isinstance(choices, dict) and set(choices) in ({"A", "B"}, set(config.CHOICE_LETTERS))):
         return config.FALLBACK_ANSWER_LETTER
 
     try:
@@ -565,16 +703,35 @@ def predict(image, query: str, choices: dict) -> str:
     except Exception:
         return config.FALLBACK_ANSWER_LETTER
 
-    # Stage 5+6: single forward pass + constrained decode, under a hard timeout
-    answer = _run_with_timeout(lambda: constrained_predict_letter(inputs), config.INFERENCE_TIMEOUT_SECONDS)
-    return answer if answer is not None else config.FALLBACK_ANSWER_LETTER
+    # Stage 5+6: single forward pass + constrained decode, under a hard timeout.
+    # valid_letters restricts the argmax to exactly this query's offered choices.
+    result = _run_with_timeout(
+        lambda: constrained_predict_with_scores(inputs, valid_letters=list(choices.keys())),
+        config.INFERENCE_TIMEOUT_SECONDS,
+    )
+    return result[0] if result is not None else config.FALLBACK_ANSWER_LETTER
 ```
 
-Differences from an earlier draft of this section, made explicit: the coarse-modality-only `detect_modality()` import is now `route_modality()` (returns `(modality, subtype)`); `preprocess_image()` takes both `modality` and `subtype`; `.to("cuda")` is `.to(config.DEVICE)`; and the corrupt-image/malformed-choices/timeout guards (Section 5.5) are inline in the real function, not layered on separately as this section previously implied.
+Differences from an earlier draft of this section, made explicit: `Image.open()` is now preceded by Stage -1's `load_volume()` dispatch (Section 1.5); the coarse-modality-only `detect_modality()` import is now `route_modality()` (returns `(modality, subtype)`); `preprocess_image()` takes both `modality` and `subtype`; the malformed-choices guard now accepts either the 4-choice key set or the 2-choice `{"A","B"}` set (`config.CHOICE_SET_OPTIONS`), not only 4; `.to("cuda")` is `.to(config.DEVICE)`; and the corrupt-image/malformed-choices/timeout guards (Section 5.5) are inline in the real function, not layered on separately as this section previously implied.
+
+**Two additional entry points share `_load_input_image()` and the Stage 0-2 preprocessing above, but diverge from Stage 3 onward — neither is used by the competition path, both live in `src/predict.py` for the evaluation tooling in Section 5.6:**
+
+- **`predict_with_diagnostics(image, query, choices) -> dict`** — used by `evaluate_omnimed.py`'s default `--scoring-method pipeline`. Runs the exact same Stage 0-6 as `predict()` above, with two differences: an image that can't be loaded/decoded at all (or a Stage 0-4 crash on one that did load) is retried **once** on a neutral gray canvas (`config.BLIND_FALLBACK_IMAGE_SIZE`/`BLIND_FALLBACK_GRAY_VALUE`) instead of short-circuiting straight to `config.FALLBACK_ANSWER_LETTER` — the model still gets to reason from the question text and choices alone, rather than the answer being decided before it's ever called — and it returns a rich diagnostics dict (`answer`, `modality`, `subtype`, `track`, `fallback_triggered`, `fallback_reason`, `top1_logit`/`top2_logit`/`logit_margin` from `constrained_predict_with_scores`' returned scores dict, `inference_time`) instead of just the winning letter. Stage 5-6's timeout is deliberately *not* retried on the gray canvas — a stalled forward pass is a latency problem, not a content problem, and doubling GPU work per query would only worsen timeout-budget pressure.
+- **`predict_by_prefix_score(image, query, choices) -> dict`** — used by `evaluate_omnimed.py`'s `--scoring-method prefix_score`. Same Stage -1/0/1/2 handling and blind-fallback behavior as above, but Stages 3-6 are replaced entirely with a replication of OmniMedVQA's own published "Prefix-based Score" methodology (`src/prefix_score.py`, Section 5.6) — no track/system-prompt, one forward pass per candidate option instead of one total.
 
 ### 5.3 Harness / CSV Writer
 
-**As implemented** (`run_predictions.py`, at the repository root — not inside a `submission/` wrapper; see Section 5.1):
+**Two harness entrypoints exist at the repository root, not one — `eval.py` and `run_predictions.py` — and `eval.py`, not `run_predictions.py`, is the actual competition entrypoint.** `run_predictions.py` (documented below) is a generic scaffold that depends on an undefined `data_loader.py` ("user-provided or harness-provided"); `eval.py` implements the competition's actual fixed invocation contract directly and needs nothing else supplied.
+
+**`eval.py` — the competition entrypoint (`python eval.py input_dir <path_to_queries>`):**
+
+- Reads `dev_metadata.csv` from the given directory (columns: `query_id, image, question, choice_A, choice_B, choice_C, choice_D`, with `choice_C`/`choice_D` empty for 2-choice/Yes-No rows) and resolves each row's `image` cell to a local path under `<path>/Images/` (or a few other plausible locations — the exact prefix convention isn't specified by the harness).
+- **`_resolve_image_path()` tries an exact-name match first, then falls back to a regex scan for browser-downloaded-duplicate filenames** (`"0002.png"` referenced in the CSV, `"0002 (1).png"` actually on disk) — confirmed against a real competition dev-data sample, where this pattern affected roughly 70% of rows before the fallback was added; without it, those rows all silently degraded to the blind fallback letter with no image ever loaded.
+- **Reads the CSV as `cp1252`, not `latin1`.** The dev metadata file (Excel/Windows-authored) contains Windows-1252 curly-quote bytes (e.g. `0x92` = right single quotation mark) that `latin1` decodes without error but into the *wrong* character (a stray C1 control code, not the intended apostrophe) — corrupting answer-choice text that flows straight into the model prompt. `cp1252` decodes the same file correctly with zero errors.
+- Calls `predict()` (not `predict_with_diagnostics()`/`predict_by_prefix_score()` — this is the strict competition path, Section 5.2) once per row, under the same zero-crash contract as `predict()` itself: an unresolvable image path skips straight to `config.FALLBACK_ANSWER_LETTER` without calling `predict()` at all, and any exception `predict()` itself doesn't already catch is caught here too, as a final backstop — every row in `dev_metadata.csv` gets exactly one output row, never zero.
+- Writes `predictions.csv` (`query_id, answer, inference_time`) to the current working directory.
+
+**`run_predictions.py` — generic scaffold** (documented as originally written; unchanged this pass):
 
 ```python
 # run_predictions.py
@@ -604,7 +761,7 @@ if __name__ == "__main__":
 
 ### 5.4 `requirements.txt`
 
-**Current actual content** (`flash-attn` is commented out — see the note below and Section 4.4):
+**Current actual content** (`flash-attn` and `bitsandbytes` are both commented out — see the notes below and Section 4.4):
 
 ```
 torch>=2.5.0
@@ -619,25 +776,68 @@ sentence-transformers>=3.0.0
 scikit-image>=0.24.0
 datasets>=2.19.0
 huggingface_hub>=0.23.0
+nibabel>=5.2.0
+pydicom>=2.4.0
 # flash-attn>=2.6.0
+# bitsandbytes>=0.43.0
 ```
 
 **No `autoawq` or `gptqmodel`, deliberately:** the backbone migrated off AWQ-quantized Qwen2-VL-7B specifically to eliminate this dependency chain (Section 3.3) — `autoawq` is archived/deprecated (2025-05-11, unmaintained since), and its successor `gptqmodel` requires a C++ toolchain to build from source on Windows, which `transformers`' AWQ quantizer eventually made a hard, unconditional runtime requirement with no config-level opt-out. Neither package is needed at all for native, unquantized Qwen3-VL loading.
 
 `transformers>=4.57.0` (bumped from `4.45.0`): 4.57.0 is the minimum release with Qwen3-VL support (`Qwen3VLForConditionalGeneration`, `Qwen3VLProcessor`).
 
-`torch>=2.5.0` / `torchvision>=0.20.0` (bumped from `2.3.0`): this floor predates the Qwen3-VL migration — it was originally driven by `Qwen2VLVideoProcessor` requiring PyTorch >= 2.5 (disabling itself with an `ImportError` otherwise). `Qwen3VLProcessor` wraps `Qwen2VLImageProcessor` for images and `Qwen3VLVideoProcessor` for video (per `transformers`' own Qwen3-VL docs), so the same torch-version sensitivity carries forward; the floor stays at `2.5.0` regardless. `datasets` / `huggingface_hub` support `src/evaluate_omnimed.py`'s OmniMedVQA loading (Section 5, evaluation tooling) and aren't needed by the `predict()` runtime path itself.
+`torch>=2.5.0` / `torchvision>=0.20.0` (bumped from `2.3.0`): this floor predates the Qwen3-VL migration — it was originally driven by `Qwen2VLVideoProcessor` requiring PyTorch >= 2.5 (disabling itself with an `ImportError` otherwise). `Qwen3VLProcessor` wraps `Qwen2VLImageProcessor` for images and `Qwen3VLVideoProcessor` for video (per `transformers`' own Qwen3-VL docs), so the same torch-version sensitivity carries forward; the floor stays at `2.5.0` regardless.
 
-*(Pin exact versions post-validation against the offline environment. `flash-attn` is commented out because it requires a matching CUDA toolkit and is often not buildable without sudo in the offline eval environment; `src/model_loader.py`'s `_load_model()` already falls back to the `sdpa` attention backend automatically when it's unavailable (Section 4.1/4.4), so leaving it commented out is a safe default, not a broken one. Uncomment and reinstall only once a compatible wheel/toolkit is confirmed available in the target environment.)*
+`nibabel`/`pydicom` (new, required, not optional): Stage -1's volumetric/DICOM ingest (Section 1.5) depends on both directly — unlike `flash-attn`/`bitsandbytes` below, there's no runtime fallback if these are missing; `src/volume_loader.py` raises `ImportError` at import time with a message pointing back here.
+
+`bitsandbytes` (new, **commented out**, opt-in): only needed if `config.QUANTIZATION_MODE` is set (Section 3.3) or `src/train_lora.py`'s default 4-bit QLoRA path is used (Section 3.2) — CUDA-only, uncommented/installed on demand rather than unconditionally, the same treatment as `flash-attn` below.
+
+`datasets`/`huggingface_hub`: **no longer used by `src/evaluate_omnimed.py`**, despite an earlier version of this document's claim — that module was refactored this pass to read a local OmniMedVQA mirror directly (`json.load()`, no `datasets` library, no Hub access at all; Section 5.6). `huggingface_hub` remains listed because `snapshot_download()` is still the documented way to fetch the *base model weights themselves* (Section 5.1's `weights/qwen3-vl-4b-instruct/`) into a fresh environment (e.g. a Colab/Kaggle notebook, Sections 5.6/5.7); `datasets` is no longer required by anything in this repository and is a candidate for removal, not yet done this pass.
+
+*(Pin exact versions post-validation against the offline environment. `flash-attn` is commented out because it requires a matching CUDA toolkit and is often not buildable without sudo in the offline eval environment; `src/model_loader.py`'s `_load_model()` already falls back to the `sdpa` attention backend automatically when it's unavailable (Section 4.1/4.4), so leaving it commented out is a safe default, not a broken one. `bitsandbytes` is commented out for the same reason plus the fact that it's genuinely optional — `config.QUANTIZATION_MODE` defaults to `None` and the competition deployment doesn't need it (Section 3.3). Uncomment either and reinstall once actually needed/confirmed available in the target environment.)*
 
 ### 5.5 Failure-Mode Safeguards
 
-**As implemented** (`src/predict.py`):
+**As implemented** (`src/predict.py`, `src/volume_loader.py`):
 
-- **Timeout guard:** `_run_with_timeout()` wraps the Stage 5+6 constrained-decode call (`constrained_predict_letter()`, which itself calls `model(**inputs)`) on a **daemon worker thread**, with a `config.INFERENCE_TIMEOUT_SECONDS` (default `5.0`) join timeout — thread-based rather than signal-based, since `signal.alarm` is unavailable on Windows and unsafe outside the main thread. This can't forcibly cancel a stuck CUDA call — the worker thread keeps running in the background — but it does prevent one stalled query from blocking the harness's average-inference-time measurement. On timeout or any exception, returns `config.FALLBACK_ANSWER_LETTER` (currently `"A"`, a fixed constant, not a distribution-derived value).
-- **Corrupt/unreadable image guard:** `try/except` around `PIL.Image.open()` / `.load()`, catching `UnidentifiedImageError`, `OSError`, and `ValueError`; on failure, returns `config.FALLBACK_ANSWER_LETTER` immediately, before any other stage runs.
-- **Empty/malformed choices guard:** validates that `choices` is a `dict` whose key set is **exactly** `{"A", "B", "C", "D"}` (`set(choices) == set(config.CHOICE_LETTERS)`) — not merely "4 keys" of any kind — before any prompt construction; degrades to the fallback letter otherwise.
-- **Deterministic decoding:** no `generate()`/sampling call exists in the hot path at all — `constrained_predict_letter()` runs a single forward pass and an `argmax` over precomputed candidate logits (Section 4.2), so there is no `do_sample` flag to get wrong; behavior is deterministic and reproducible by construction.
+- **Timeout guard:** `_run_with_timeout()` wraps the Stage 5+6 constrained-decode call (`constrained_predict_with_scores()`, which itself calls `model(**inputs)`) on a **daemon worker thread**, with a `config.INFERENCE_TIMEOUT_SECONDS` (default `5.0`) join timeout — thread-based rather than signal-based, since `signal.alarm` is unavailable on Windows and unsafe outside the main thread. This can't forcibly cancel a stuck CUDA call — the worker thread keeps running in the background — but it does prevent one stalled query from blocking the harness's average-inference-time measurement. On timeout or any exception, `predict()` returns `config.FALLBACK_ANSWER_LETTER` (currently `"A"`, a fixed constant, not a distribution-derived value). **`predict_by_prefix_score()` (Section 5.2/5.6) deliberately has no equivalent guard** — it runs 2-4 untimed forward passes per query (one per candidate option), so a single slow/stuck call there is not bounded the way the competition path is; this is a known, accepted trade-off of that evaluation-only tool, not a gap in the competition path itself.
+- **Volumetric/DICOM ingest guard (Stage -1, new — Section 1.5):** `load_volume()` raises `VolumeLoadError` for anything confidently identified as volumetric/DICOM but undecodable (corrupt file, empty series folder, unsupported internal encoding); `_load_input_image()` catches it in the same guard as the corrupt-image case below, degrading to the fallback letter identically. Internally, `volume_loader.py` layers its own graded fallback chain *before* ever reaching that point (Section 1.5) — a `VolumeLoadError` is the last resort, not the first response to any hiccup.
+- **Corrupt/unreadable image guard:** `try/except` around Stage -1 + `PIL.Image.open()` / `.load()`, catching `VolumeLoadError`, `UnidentifiedImageError`, `OSError`, and `ValueError`; on failure, returns `config.FALLBACK_ANSWER_LETTER` immediately, before any other stage runs.
+- **Empty/malformed choices guard:** validates that `choices` is a `dict` whose key set is **exactly** one of `config.CHOICE_SET_OPTIONS` — `{"A", "B"}` (2-choice/Yes-No) or `{"A", "B", "C", "D"}` — not merely "some keys" of any kind; degrades to the fallback letter otherwise.
+- **Deterministic decoding:** no `generate()`/sampling call exists in the hot path at all — `constrained_predict_with_scores()` runs a single forward pass and an `argmax` over precomputed candidate logits (Section 4.2), so there is no `do_sample` flag to get wrong; behavior is deterministic and reproducible by construction.
+- **Blind-fallback-not-hardcoded-letter (evaluation tooling only, Section 5.2/5.6):** `predict_with_diagnostics()`/`predict_by_prefix_score()` retry an unreadable image once on a neutral gray canvas rather than immediately returning the fallback letter — the competition path (`predict()`) does not do this and keeps its original immediate-fallback behavior unchanged, since this is a deliberate scope boundary, not an oversight (see Section 5.2).
+
+### 5.6 Evaluation Tooling: SOTA Comparison Against OmniMedVQA
+
+Beyond the competition harness (Section 5.3), two modules exist purely to measure this pipeline's accuracy against OmniMedVQA — the same benchmark the fine-tuning strategy (Section 3.2) draws from — in a way genuinely comparable to published leaderboard numbers, not just for internal tracking. Neither is imported by `eval.py`/`predict()`; both are `src/evaluate_omnimed.py`/`src/prefix_score.py`, run standalone.
+
+**`src/evaluate_omnimed.py` — local-mirror OmniMedVQA harness.** Reads directly from a local directory mirror (`--data-root`, default `/content/drive/MyDrive/OmniMedVQA` — written for a Google Drive mount in Colab, but any local path works) laid out as `{data_root}/QA_information/Open-access/{dataset_name}.json` + `{data_root}/Images/{dataset_name}/{image_file_name}`, with **no Hugging Face Hub access at all** — a deliberate change from an earlier version of this tooling that downloaded via `huggingface_hub.snapshot_download()` and parsed JSON via the `datasets` library; both were replaced with plain `json.load()` (tolerating both a JSON array and JSON Lines, since real dataset dumps use either) and a `_require_local_data_root()` existence check with no fallback download. Only `QA_information/Open-access/` is ever read (Restricted-access items reference images that typically aren't distributed, so they can't be scored here anyway). `_resolve_image_path()` tries `{data_root}/Images/{dataset_name}/{basename of image_path}` first (the authoritative convention for this local layout) with two looser fallbacks for dump variations; `_resolve_gt_letter()` handles `gt_answer` being either a bare letter or the answer's full text (not pinned down by the dataset's own documentation).
+
+Every sample with resolvable ground truth gets scored, whether or not its image resolves locally — an unresolvable/corrupt/volumetric image is **not** skipped, it's handled by the chosen scorer's blind-fallback path (Section 5.2) and still produces an honest (almost certainly wrong) data point rather than a silently dropped row. `--scoring-method {pipeline, prefix_score}` selects which of `predict.py`'s two diagnostics-returning entry points runs the actual scoring (default `pipeline`, i.e. `predict_with_diagnostics()`).
+
+Two output files, always both written: `predictions.csv` (`query_id, answer, inference_time` — the exact 3-column format `eval.py` writes, directly comparable to a real submission) and `eval_diagnostic_log.csv` (`query_id, answer, gold, correct, inference_time, predicted_modality, predicted_intent, n_choices, fallback_triggered, fallback_reason, top1_logit, top2_logit, logit_margin`). Console output reports overall exact-match accuracy with a 95% bootstrap confidence interval (10,000 resamples, `numpy.random.default_rng`), accuracy stratified by ground-truth `modality_type` and by `n_choices`, and the overall fallback rate.
+
+**`src/prefix_score.py` — OmniMedVQA's own published "Prefix-based Score" metric, replicated.** OmniMedVQA's paper reports two metrics per model, neither of which is this pipeline's Stage 6 letter-argmax: "Question-answering Score" (the model generates free text, embedded and matched by similarity to the nearest candidate option — **not implemented here**) and "Prefix-based Score" (the log-likelihood of each full candidate option's *text*, not just its letter, as a continuation of a plain completion prompt — **this is what `prefix_score.py` replicates**), read directly from the paper's own reference implementation (`OpenGVLab/Multi-Modality-Arena`, `MedicalEval/Prefix_based_Score/`):
+
+1. A plain completion prompt with **no options listed at all**: `"Question: {question} The answer is"`.
+2. For each candidate option's full text, tokenize `" {candidate_text}."` appended after that prompt, run one forward pass, and compute the mean cross-entropy loss over *only* the candidate+period tokens (everything before is masked to `-100`, PyTorch's default `ignore_index`).
+3. The candidate with the **lowest** mean loss is the prediction.
+
+Adapted for Qwen3-VL (the reference code drives older VLMs like LLaVA/BLIP-2/MiniGPT-4 through a raw string-completion API with an inline `<image>` token, which Qwen3-VL — an instruction-tuned chat model — has no equivalent of): the same prompt text becomes the sole user turn's content via the normal chat template (`add_generation_prompt=True`), and the candidate text is scored as if it were the assistant's completion. Each candidate reprocesses the full (prompt+candidate) text through the processor from scratch, rather than manually splicing pre-tokenized token ids onto a cached prefix — a deliberate choice after discovering Qwen3-VL's M-RoPE position-id computation (`get_rope_index`) needs an internally-derived image/text token-type map that only stays consistent with `input_ids` when the processor builds the whole sequence itself; splicing left that map sized for a shorter, stale sequence and crashed with a shape-mismatched boolean index. `use_cache=False` is also required, not just an optimization — Qwen3-VL caches M-RoPE deltas on the model instance across forward calls for incremental generation, and each candidate here is an independent, differently-shaped sequence, not a continuation of the previous one.
+
+Sanity-checked (not just unit-tested for crashes) against the live model: given one fluent-English candidate and one gibberish candidate for the same image, the fluent one scored a substantially lower loss (large margin), confirming the mechanism measures something real. `predict_by_prefix_score()` (Section 5.2) wraps this with the same Stage -1/0/1/2 handling and blind-fallback behavior as `predict_with_diagnostics()`, costing roughly `n_choices`× the forward passes per query (2-4, one per candidate, versus 1) in exchange for a genuinely paper-comparable number.
+
+### 5.7 Fine-Tuning Tooling
+
+`src/train_lora.py` is documented in full in Section 3.2 (fine-tuning data strategy, implementation notes, and the real end-to-end validation performed). It is listed here only for the directory-layout cross-reference (Section 5.1) and because, like Section 5.6's evaluation tooling, it is a standalone script never imported by the competition path.
+
+**`src/prepare_external_dataset.py`** — converts an external (non-OmniMedVQA) dataset into the exact local-mirror shape `load_omnimed_samples()`/`evaluate_omnimed.py`/`train_lora.py` already read, so none of that code needed to change to support new data sources. Written specifically because OmniMedVQA's own CT/MRI entries are pre-sliced 2D images cut from 3D volumes (confirmed in the dataset's own README), not raw NIfTI/DICOM — meaning OmniMedVQA alone can never exercise or validate Stage -1's volumetric ingest code (Section 1.5), regardless of which CT/MRI sub-dataset is selected. Three adapters ship: `mosmed` (MosMedData chest CT, real NIfTI, 5-class severity → 4-choice MCQ), `brainmri` (Medical Segmentation Decathlon Task01_BrainTumour, real 4D NIfTI → anatomy-ID MCQ, relying on `_load_nifti()`'s existing 4D→first-channel reduction rather than needing new sequence-splitting code), and `busi` (breast ultrasound, PNG, benign/malignant/normal → 3-choice MCQ). See `datasets.md` for the full per-dataset table (what's used for evaluation vs. fine-tuning, format, size, question design) — this document intentionally does not duplicate that table.
+
+Two design choices worth calling out:
+- **Image files are referenced by absolute path, not copied** into the mirror — `_resolve_image_path()`'s `root / image_path` candidate resolves correctly for an already-absolute `image_path` (pathlib drops `root` when joining an absolute path), so multi-GB volumes never need to be moved.
+- **Splitting is case-level, not image-level**, via a deterministic seeded shuffle (`--eval-fraction`/`--seed`) — every QA item derived from the same case lands on the same side of the train/eval split, so a model can never see a case at train time and its held-out twin at eval time. Verified this session: disjoint `question_id` sets between the `_train`/`_eval` outputs of the same source dataset, plus a full round-trip through the real `predict_with_diagnostics()` on converted items with zero fallback triggered.
+
+**`kaggle_finetune_lora.ipynb`** (repo root) — the actual runnable notebook for `src/train_lora.py`, written for Kaggle's free-tier GPU (T4/P100) rather than assuming Colab's Drive-mount convenience: gets the OmniMedVQA data via a Kaggle Dataset attachment or `gdown` from a shared Drive link (Kaggle does not mount Drive natively), gets the base weights via `huggingface_hub.snapshot_download()`, runs the external-dataset conversion (previous paragraph) if the raw archives are available, runs the fine-tuning itself, and includes a separate, independently-runnable section for producing a pre-quantized, smaller base-model checkpoint for the competition submission (Section 3.3) — with an explicit on-disk size check after saving, since `save_pretrained()` on a bitsandbytes-quantized model is documented as supported by Hugging Face but was flagged by at least one other source as sometimes writing the original (non-compact) weights back out instead; this could not be fully verified end-to-end in this development environment (a local disk/memory constraint interrupted the save step, independent of the quantization mechanism itself, which loading-side diagnostics did confirm works correctly) and needs to be confirmed on Kaggle's healthier environment before being relied on for the actual submission.
 
 ---
 
@@ -653,4 +853,11 @@ huggingface_hub>=0.23.0
 | Native, unquantized backbone (Section 3.3 migration off AWQ), with an automatic `sdpa` attention fallback | Drops the autoawq/gptqmodel dependency chain entirely (deprecated/unmaintained, Windows C++ build friction) while still fitting the 48GB VRAM budget comfortably; the `sdpa` fallback keeps the system working even when `flash-attn` isn't installed (the current shipped default) |
 | Prompt-based track/modality conditioning instead of long chain-of-thought | Shapes hidden reasoning without adding generation-length latency |
 | Global pre-loading + warm-up pass | Satisfies hard rule; prevents CUDA cold-start from skewing first-query latency |
-| Fine-tune on OmniMedVQA/PMC-VQA/PathVQA/VQA-RAD offline | Compliant with "no training at evaluation time"; matches heterogeneity profile of the challenge (strategy documented in Section 3; no training script ships in this repo) |
+| Fine-tune on OmniMedVQA + 3 external volumetric/2D datasets (offline, `src/train_lora.py` + `src/prepare_external_dataset.py`, Section 3.2/5.7, full breakdown in `datasets.md`) | Compliant with "no training at evaluation time"; matches heterogeneity profile of the challenge and covers all 8 PS-named modalities on both the evaluation and fine-tuning sides, including genuine volumetric CT/MRI (OmniMedVQA alone cannot, since its CT/MRI are pre-sliced 2D); PMC-VQA/PathVQA/VQA-RAD/SLAKE remain offline-strategy-only, not wired into the training script |
+| Stage -1 volumetric/DICOM ingest, ahead of Stage 0 (Section 1.5) | Closes a real blind spot: `.nii`/DICOM inputs previously always fell back to a blind guess; a graded internal fallback chain (content-based → fixed-percentage → single-slice) degrades gracefully rather than jumping straight to "give up" |
+| Vote-MI-inspired content-based slice selection over fixed relative depths | A blind depth-fraction pick can land on an uninformative/background slice; scoring by variance + edge density picks genuinely diagnostic cross-sections, verified visually against real CT/MRI data |
+| Multi-channel (RGBY) folders composited as a 2×2 grid, not blended into one pseudo-color image | Preserves each fluorescence channel at full, unmixed resolution for the VLM to inspect directly, rather than an ambiguous blend that discards which channel contributed what |
+| Blind gray-canvas fallback (evaluation tooling only) instead of an immediate hardcoded letter | An unreadable image still gets a real (if blind) model call reasoning from question text and choices alone, rather than the answer being decided before the model is ever invoked — deliberately scoped to `predict_with_diagnostics()`/`predict_by_prefix_score()`, not the competition path, which keeps its original immediate-fallback behavior |
+| Opt-in bitsandbytes 4-bit/8-bit quantization (`config.QUANTIZATION_MODE`, default off) | The competition deployment doesn't need it (4B fits fp16 on 48GB comfortably), but `src/train_lora.py`'s default QLoRA path needs it to fit a free-tier Kaggle GPU (16GB) — zero behavior change for the existing inference path when left at the default |
+| LoRA attached via `peft.PeftModel.from_pretrained()`, not `model.load_adapter()` | `model` is only reassigned on success, so a failed/incompatible adapter leaves the original base model bound untouched, no partial-wrap state possible; `PeftModel` preserves the same call surface every downstream site already relies on |
+| Separate `evaluate_omnimed.py`/`prefix_score.py` scoring tooling, reading a local dataset mirror with no Hub access | Reports a number genuinely comparable to OmniMedVQA's own published leaderboard (Prefix-Score), not just this pipeline's own fast decode mechanism; local-only loading matches how the dataset is actually supplied in practice (a mounted Drive folder) rather than assuming live Hub access |
